@@ -33,6 +33,7 @@ def any_precision_quantize(
         num_groups=None,
         sub_saliency=None,
         skip_save_gradients=False,
+        model_name=None,
 ):
 
     # Logging with time sans date, level name, and message
@@ -81,7 +82,6 @@ def any_precision_quantize(
 
     model_string = model if isinstance(model, str) else model.name_or_path
     model_name = model_string.split("/")[-1]
-
     logging.info(f"Running Any-Precision Quantization on {model_name} with seed precision {seed_precision} and "
                  f"parent precision {parent_precision} using {dataset} for gradient calculation")
 

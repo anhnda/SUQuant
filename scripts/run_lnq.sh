@@ -1,8 +1,10 @@
 set -x
 
-MODEL_NAME=$1
+MODEL_REF=$1
 BITS=$2
 NUM_GROUPS=$3
+
+MODEL_PATH=$(python resolve_model.py "$MODEL_REF") || exit $?
 
 # Optional mode argument
 MODE_OPT=""

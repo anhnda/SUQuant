@@ -39,7 +39,8 @@ if __name__ == "__main__":
                         help="(start, end) of layers to use for quantization")
     parser.add_argument("--is_nosal", type=str2bool, default=False,
                         help="Do not use GuidedQuant Hessian")
-
+    parser.add_argument("--model_name", type=str, default=None,
+                    help="Stable short name for cache paths (defaults to basename of model path)")
     args = parser.parse_args()
     args.sub_hessian = tuple(args.sub_hessian) if args.sub_hessian else None
     args.sub_qlayer = tuple(args.sub_qlayer) if args.sub_qlayer else None
