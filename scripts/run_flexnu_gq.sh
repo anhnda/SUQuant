@@ -54,6 +54,7 @@ case "${CELL:-D}" in
 esac
 
 python layerwise_nuq.py "$MODEL_PATH" \
+  --model_name "$MODEL_REF" \
   --solver flexnu \
   --seed_precision "$BITS" \
   --dataset "$DATASET" --seq_len "$SEQ_LEN" --num_examples "$NUM_EXAMPLES" \

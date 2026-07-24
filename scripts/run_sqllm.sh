@@ -16,6 +16,7 @@ if [[ "$4" == "-m" && -n "$5" ]]; then
 fi
 
 python quantize.py "$MODEL_PATH" \
+  --model_name "$MODEL_REF" \
   --seed_precision "$BITS" --parent_precision "$BITS" \
   --dataset "$DATASET" --seq_len "$SEQ_LEN" --num_examples "$NUM_EXAMPLES" \
   --num_groups "$NUM_GROUPS" --random_state 42 $MODE_OPT

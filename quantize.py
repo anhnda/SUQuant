@@ -33,6 +33,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip_save_gradients", action="store_true",
                         help="Whether to skip saving gradients")
 
+    parser.add_argument("--model_name", type=str, default=None,
+                    help="Stable short name for cache paths "
+                         "(defaults to basename of model path)")
     args = parser.parse_args()
     args.sub_saliency = tuple(args.sub_saliency) if args.sub_saliency else None
 
