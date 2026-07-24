@@ -6,7 +6,8 @@ from tqdm import tqdm
 import numba
 from concurrent.futures import ThreadPoolExecutor
 import flash1dkmeans
-
+import torch, functools
+torch.load = functools.partial(torch.load, weights_only=False)
 
 @numba.njit(cache=True)
 def _upscale_group(orig_centroids,

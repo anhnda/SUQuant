@@ -1,6 +1,7 @@
 import argparse
 from any_precision.quantization import layerwise_nuq
-
+import torch, functools
+torch.load = functools.partial(torch.load, weights_only=False)
 def str2bool(v):
     if isinstance(v, bool):
         return v
