@@ -357,7 +357,15 @@ def _optimize_rows(
     # SqueezeLLM centroids are already sorted per row in this repo, but a
     # degenerate (empty-cluster) level can produce a zero gap.
     cb0 = init_C.clone()
-    cb0, _ = torch.sort(cb0, dim=-1)
+    cb0, perm = torch.sort(cb0, dim=-1)
+    # LNQ's update_C is an UNCONSTRAINED least-squares solve, so its codebook is
+    # not guaranteed monotone -- measured 0.20% of rows in k_proj (min gap
+    # -6.45e-02), 0% in q_proj. Sorting without remapping the labels silently
+    # repoints every index at a different codeword: identical labels, permuted
+    # table, wrong objective.
+    inv = torch.argsort(perm, dim=-1)
+    init_labels = torch.gather(inv, 1, init_labels.clamp(0, K - 1))
+    
     eps = 1e-6
     for k in range(1, K):
         cb0[:, k] = torch.maximum(cb0[:, k], cb0[:, k - 1] + eps)
