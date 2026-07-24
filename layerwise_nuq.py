@@ -59,6 +59,7 @@ if __name__ == "__main__":
                         help="TV penalty on |exp(g+)|+|exp(g-)|")
     parser.add_argument("--flexnu_freeze_codebook", type=str2bool, default=False)
     parser.add_argument("--flexnu_freeze_scale", type=str2bool, default=False)
+    parser.add_argument("--flexnu_delta_init_noise", type=float, default=0.0)
     args = parser.parse_args()
     args.sub_hessian = tuple(args.sub_hessian) if args.sub_hessian else None
     args.sub_qlayer = tuple(args.sub_qlayer) if args.sub_qlayer else None
