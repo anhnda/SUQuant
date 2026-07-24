@@ -132,6 +132,88 @@ def _codebook_from_params(anchor: torch.Tensor, gaps_raw: torch.Tensor) -> torch
 
 
 # --------------------------------------------------------------------------- #
+# Signed multiplier  G = exp(gamma+) - exp(gamma-)
+# --------------------------------------------------------------------------- #
+# The positive divisor q = W*exp(-delta2) CANNOT change sign, so it spans only
+# sign-preserving reassignments. Measured on Llama-3.2-1B layer 0 q_proj: of
+# LNQ's 22.33% non-nearest choices, 15.79% cross zero and are unreachable --
+# and those 3.53% of weights account for ~33% of the energy gap, because a
+# sign-crossing is the largest available |r_i| with a flipped sign, i.e. the
+# strongest cancellation against a coupled coordinate.
+#
+# Signed G fixes this: {W*G : G in R} = R for any W != 0, so every cell is
+# reachable. Verified: 100% target reachability vs 97.8% for the positive form.
+#
+# WHY DECOMPOSE THE MULTIPLIER, NOT THE DIVISOR
+# Writing S = exp(a) - exp(b) and dividing puts the singularity S = 0 directly
+# on the flip path: W_hat -> +/-inf mid-crossing. Decomposing the RECIPROCAL
+# puts G = 0 on the path instead, giving q = 0 -- a legitimate query that lands
+# in whichever cell contains zero. Every state along nearest -> shrink -> zero
+# -> opposite sign is a valid quantization, so the path is continuous with
+# bounded gradient.
+#
+# PROP 3.1 SURVIVES. dL/dgamma+- = +/-exp(gamma+-) * W * dL/dW_hat, still
+# directly proportional to W, so FlexRound's magnitude-awareness is preserved --
+# and without the 1/S'^2 blowup of the original form.
+def _signed_G(gamma_p: torch.Tensor, gamma_m: torch.Tensor) -> torch.Tensor:
+    """G = exp(gamma_p) - exp(gamma_m), stable near the G = 1 init."""
+    return 1.0 + torch.expm1(gamma_p) - torch.exp(gamma_m)
+
+
+def _init_signed_gamma(R: int, din: int, eps: float, device, dtype):
+    """exp(gamma_p) = 1+eps, exp(gamma_m) = eps  =>  G = 1 exactly.
+
+    So the step-0 forward pass is bit-identical to nearest-codeword, matching
+    the design intent that reconstruction starts at RTN and can only improve.
+
+    eps also sets FLIP RESISTANCE, and only flip resistance: dG/dgamma_m carries
+    a factor exp(gamma_m) = eps, so the flip direction is damped by (1+eps)/eps
+    relative to ordinary grid-shift movement -- 21x at eps=0.05. Normal
+    FlexRound flexibility (the gamma_p path) is untouched.
+    eps -> 0 recovers the positive-only method; eps >~ 1 hits fp cancellation.
+    """
+    gp = torch.full((R, din), float(np.log(1.0 + eps)), device=device, dtype=dtype)
+    gm = torch.full((R, din), float(np.log(eps)), device=device, dtype=dtype)
+    return gp, gm
+
+
+@torch.no_grad()
+def _invert_G_for_labels(W: torch.Tensor,
+                         cb: torch.Tensor,
+                         labels: torch.Tensor,
+                         clamp: float = 1e4) -> torch.Tensor:
+    """Signed G such that searchsorted(midpoints(cb), W*G) == labels.
+
+    Unlike the positive-divisor inversion this has no sign restriction: for
+    W != 0 the set {W*G : G in R} is all of R, so EVERY target cell is
+    reachable. Only W == 0 is degenerate (q = 0 regardless of G).
+    """
+    R, din = W.shape
+    K = cb.shape[-1]
+    dev, dt = W.device, W.dtype
+    BIG = torch.finfo(dt).max
+
+    th = 0.5 * (cb[:, 1:] + cb[:, :-1])
+    lo_all = torch.cat([torch.full((R, 1), -BIG, device=dev, dtype=dt), th], 1)
+    hi_all = torch.cat([th, torch.full((R, 1), BIG, device=dev, dtype=dt)], 1)
+    lo = torch.gather(lo_all, 1, labels)
+    hi = torch.gather(hi_all, 1, labels)
+
+    # Target a finite interior point of (lo, hi]. Where a side is open, step a
+    # codeword-scale distance beyond the finite side rather than to +/-BIG.
+    span = (cb[:, -1:] - cb[:, :1]).clamp(min=1e-6)          # [R,1]
+    lo_f = torch.where(lo <= -BIG, hi - span, lo)
+    hi_f = torch.where(hi >= BIG, lo + span, hi)
+    tgt_q = 0.5 * (lo_f + hi_f)
+
+    safe_W = torch.where(W.abs() < 1e-12,
+                         torch.full_like(W, 1e-12) * torch.sign(W).clamp(min=0) * 2 - 1e-12,
+                         W)
+    G = (tgt_q / safe_W).clamp(-clamp, clamp)
+    return torch.where(W.abs() < 1e-12, torch.ones_like(G), G)
+
+
+# --------------------------------------------------------------------------- #
 # Warm start: invert the divisor so q = W*exp(-delta2) reproduces given labels.
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -261,6 +343,9 @@ def _optimize_rows(
     lambda_s2: float,
     use_init_labels: bool = False,
     delta_init_noise: float = 0.0,
+    signed_g: bool = False,
+    signed_eps: float = 0.05,
+    lambda_tv: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
     """Returns (codebook [R,K], labels [R,in], e_init, e_best)."""
     R, din = Wrows.shape
@@ -303,8 +388,17 @@ def _optimize_rows(
 
         # Warm-start the divisor so the forward pass reproduces idx0.
         if use_init_labels:
-            d0 = _invert_delta_for_labels(Wrows, cb0, idx0)
-            q0 = Wrows * torch.exp(-d0)
+            if signed_g:
+                # Signed G reaches EVERY cell (no sign restriction), so the
+                # warm start reproduces LNQ exactly rather than losing the
+                # sign-crossings.
+                g0 = _invert_G_for_labels(Wrows, cb0, idx0)
+                d0 = None
+                q0 = Wrows * g0
+            else:
+                d0 = _invert_delta_for_labels(Wrows, cb0, idx0)
+                g0 = None
+                q0 = Wrows * torch.exp(-d0)
             idx_real = torch.searchsorted(th0.contiguous(),
                                           q0.contiguous()).clamp_(0, K - 1)
             e_real = float(energy(torch.gather(cb0, 1, idx_real)).item())
@@ -319,6 +413,7 @@ def _optimize_rows(
             best_idx0 = idx_real
         else:
             d0 = None
+            g0 = None
 
     n_steps = 0 if (freeze_codebook and freeze_scale) else int(iters)
 
@@ -328,21 +423,41 @@ def _optimize_rows(
         # delta2: element-wise log-divisor (FlexRound S2).
         # Init 0 -> divisor 1 -> nearest-codeword, UNLESS warm-started from d0,
         # in which case it starts at the value encoding LNQ's assignments.
-        if d0 is not None:
-            _d2 = d0.clone()
+        if signed_g:
+            # G = exp(gamma_p) - exp(gamma_m), init to G = 1 (== nearest).
+            gp0, gm0 = _init_signed_gamma(R, din, signed_eps, dev, wdt)
+            if g0 is not None:
+                # Encode the warm-started G. Split so that
+                #   exp(gp) - exp(gm) = G, with the SAME eps-scale damping:
+                #   G >= 0 -> gp = log(G + eps), gm = log(eps)
+                #   G <  0 -> gp = log(eps),     gm = log(eps - G)
+                e = float(signed_eps)
+                gp0 = torch.log(torch.clamp(g0, min=0.0) + e)
+                gm0 = torch.log(torch.clamp(-g0, min=0.0) + e)
             if delta_init_noise > 0:
-                _d2 = _d2 + torch.randn_like(_d2) * delta_init_noise
-        elif delta_init_noise > 0:
-            _d2 = torch.randn(R, din, device=dev, dtype=wdt) * delta_init_noise
+                gp0 = gp0 + torch.randn_like(gp0) * delta_init_noise
+                gm0 = gm0 + torch.randn_like(gm0) * delta_init_noise
+            gamma_p = gp0.clone().requires_grad_(not freeze_scale)
+            gamma_m = gm0.clone().requires_grad_(not freeze_scale)
+            delta2 = None
         else:
-            _d2 = torch.zeros(R, din, device=dev, dtype=wdt)
-        delta2 = _d2.requires_grad_(not freeze_scale)
+            gamma_p = gamma_m = None
+            if d0 is not None:
+                _d2 = d0.clone()
+                if delta_init_noise > 0:
+                    _d2 = _d2 + torch.randn_like(_d2) * delta_init_noise
+            elif delta_init_noise > 0:
+                _d2 = torch.randn(R, din, device=dev, dtype=wdt) * delta_init_noise
+            else:
+                _d2 = torch.zeros(R, din, device=dev, dtype=wdt)
+            delta2 = _d2.requires_grad_(not freeze_scale)
         # delta3: per-output-channel log-divisor (FlexRound s3), init 0
         delta3 = (torch.zeros(R, 1, device=dev, dtype=wdt).requires_grad_(not freeze_scale)
                   if use_delta3 else None)
 
         learn_cb, learn_sc = not freeze_codebook, not freeze_scale
-        _sp = [delta2] + ([delta3] if delta3 is not None else [])
+        _sp = ([gamma_p, gamma_m] if signed_g else [delta2])
+        _sp = _sp + ([delta3] if delta3 is not None else [])
 
         # DEFAULT IS JOINT (stage_frac = 0). Staging the divisor after the
         # codebook starts delta2 = 0 on a grid already fitted to W -- exactly
@@ -380,12 +495,24 @@ def _optimize_rows(
         best_state = None
         ev = max(1, int(eval_every))
 
+        def _query(detach: bool = False):
+            """Perturbed query q. Signed-G form can cross zero; the positive
+            divisor form cannot -- see _signed_G for why that matters."""
+            if signed_g:
+                G = _signed_G(gamma_p, gamma_m)
+                if delta3 is not None:
+                    G = G * torch.exp(-delta3)
+                if detach:
+                    G = G.detach()
+                return Wrows * G
+            ld = delta2 if delta3 is None else delta2 + delta3
+            return Wrows * torch.exp(-(ld.detach() if detach else ld))
+
         @torch.no_grad()
         def _hard_energy():
             cb_ = _codebook_from_params(anchor, gaps)
             th_ = 0.5 * (cb_[:, 1:] + cb_[:, :-1])
-            ld_ = delta2 if delta3 is None else delta2 + delta3
-            q_ = Wrows * torch.exp(-ld_)
+            q_ = _query()
             i_ = torch.searchsorted(th_.contiguous(), q_.contiguous()).clamp_(0, K - 1)
             return float(energy(torch.gather(cb_, 1, i_)).item())
 
@@ -404,9 +531,8 @@ def _optimize_rows(
             # backward bump neither saturates nor smears as the gaps move.
             tau = float(tau_frac * deltas.detach().mean().clamp(min=1e-12))
 
-            # FlexRound divisor: quantize against W / (S2 . s3) ...
-            log_div = delta2 if delta3 is None else delta2 + delta3
-            q = Wrows * torch.exp(-log_div)                 # [R,in]
+            # FlexRound divisor: quantize against the perturbed query ...
+            q = _query()                                   # [R,in]
 
             # ... but dequantize by the codebook alone, so W_hat need NOT be
             # the nearest codeword to W. That asymmetry is the whole method.
@@ -414,11 +540,19 @@ def _optimize_rows(
             W_hat = cb[:, :1] + (ind * deltas.unsqueeze(1)).sum(dim=-1)   # [R,in]
 
             loss = energy(W_hat)
-            if lambda_s2 > 0.0 and not freeze_scale:
-                reg = (delta2 * delta2).sum()
-                if delta3 is not None:
-                    reg = reg + (delta3 * delta3).sum()
-                loss = loss + lambda_s2 * reg
+            if not freeze_scale:
+                if signed_g and lambda_tv > 0.0:
+                    # Total variation of the signed measure. Shrinks toward
+                    # G = 0 (prune) rather than toward a flip, so gratuitous
+                    # sign changes are penalised while legitimate ones -- the
+                    # ones the loss actually pays for -- survive.
+                    loss = loss + lambda_tv * (torch.exp(gamma_p)
+                                               + torch.exp(gamma_m)).sum()
+                elif lambda_s2 > 0.0 and not signed_g:
+                    reg = (delta2 * delta2).sum()
+                    if delta3 is not None:
+                        reg = reg + (delta3 * delta3).sum()
+                    loss = loss + lambda_s2 * reg
 
             loss.backward()
             opt.step()
@@ -427,14 +561,19 @@ def _optimize_rows(
                 e_now = _hard_energy()
                 if e_now < best_e:
                     best_e = e_now
+                    _sc = ((gamma_p.detach().clone(), gamma_m.detach().clone())
+                           if signed_g else delta2.detach().clone())
                     best_state = (anchor.detach().clone(), gaps.detach().clone(),
-                                  delta2.detach().clone(),
+                                  _sc,
                                   None if delta3 is None else delta3.detach().clone())
 
         if best_state is not None:
             with torch.no_grad():
                 anchor.copy_(best_state[0]); gaps.copy_(best_state[1])
-                delta2.copy_(best_state[2])
+                if signed_g:
+                    gamma_p.copy_(best_state[2][0]); gamma_m.copy_(best_state[2][1])
+                else:
+                    delta2.copy_(best_state[2])
                 if delta3 is not None:
                     delta3.copy_(best_state[3])
         elif n_steps > 0:
@@ -444,7 +583,11 @@ def _optimize_rows(
             # nearest-codeword instead.
             with torch.no_grad():
                 anchor.copy_(anchor0); gaps.copy_(gaps0)
-                delta2.copy_(d0 if d0 is not None else torch.zeros_like(delta2))
+                if signed_g:
+                    gamma_p.copy_(gp0); gamma_m.copy_(gm0)
+                else:
+                    delta2.copy_(d0 if d0 is not None
+                                 else torch.zeros_like(delta2))
                 if delta3 is not None:
                     delta3.zero_()
 
@@ -452,8 +595,7 @@ def _optimize_rows(
     with torch.no_grad():
         cb = _codebook_from_params(anchor, gaps).detach()
         thresh = 0.5 * (cb[:, 1:] + cb[:, :-1])
-        log_div = delta2 if delta3 is None else delta2 + delta3
-        q = Wrows * torch.exp(-log_div.detach())
+        q = _query(detach=True)
         # searchsorted on the (structurally sorted) thresholds == argmin
         # |q - c_j|, but O(log K) and allocation-free.
         idx = torch.searchsorted(thresh.contiguous(), q.contiguous()).clamp_(0, K - 1)
@@ -485,6 +627,9 @@ def train_flexnu(
     damp_hessian: bool = True,
     use_init_labels: bool = False,
     delta_init_noise: float = 0.0,
+    signed_g: bool = False,
+    signed_eps: float = 0.05,
+    lambda_tv: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """FlexNu solver for GuidedQuant Eq. (7).
 
@@ -545,6 +690,7 @@ def train_flexnu(
                 eval_every=eval_every, lambda_s2=lambda_s2,
                 use_init_labels=use_init_labels,
                 delta_init_noise=delta_init_noise,
+                signed_g=signed_g, signed_eps=signed_eps, lambda_tv=lambda_tv,
             )
             C_out[r0:r1] = cb
             labels_out[r0:r1] = idx

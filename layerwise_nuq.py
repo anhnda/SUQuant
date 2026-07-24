@@ -43,8 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default=None,
                     help="Stable short name for cache paths (defaults to basename of model path)")
     parser.add_argument("--solver", type=str, default="lnq",
-                        choices=["lnq", "flexnu", "lnqflexnu"])
-    parser.add_argument("--flexnu_delta_init_noise", type=float, default=0.0)    
+                        choices=["lnq", "flexnu"])
     parser.add_argument("--flexnu_iters", type=int, default=300)
     parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
     parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)
@@ -52,6 +51,12 @@ if __name__ == "__main__":
     parser.add_argument("--flexnu_tau_frac", type=float, default=0.5)
     parser.add_argument("--flexnu_stage_frac", type=float, default=0.0)
     parser.add_argument("--flexnu_eval_every", type=int, default=1)
+    parser.add_argument("--flexnu_signed_g", type=str2bool, default=False,
+                        help="signed multiplier G = exp(g+)-exp(g-); enables sign-crossing reassignments")
+    parser.add_argument("--flexnu_signed_eps", type=float, default=0.05,
+                        help="flip resistance; damping = (1+eps)/eps")
+    parser.add_argument("--flexnu_lambda_tv", type=float, default=0.0,
+                        help="TV penalty on |exp(g+)|+|exp(g-)|")
     parser.add_argument("--flexnu_freeze_codebook", type=str2bool, default=False)
     parser.add_argument("--flexnu_freeze_scale", type=str2bool, default=False)
     args = parser.parse_args()

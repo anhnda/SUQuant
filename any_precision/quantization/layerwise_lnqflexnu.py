@@ -92,6 +92,9 @@ def train_lnq_flexnu(
     lambda_s2: float = 0.0,
     damp_hessian: bool = True,
     delta_init_noise: float = 0.0,
+    signed_g: bool = False,
+    signed_eps: float = 0.05,
+    lambda_tv: float = 0.0,
     skip_lnq: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """LNQ to convergence, then FlexNu from LNQ's solution.
@@ -181,6 +184,7 @@ def train_lnq_flexnu(
                 # worse than LNQ's committed solution.
                 use_init_labels=True,
                 delta_init_noise=delta_init_noise,
+                signed_g=signed_g, signed_eps=signed_eps, lambda_tv=lambda_tv,
                 iters=iters, lr_scale=lr_scale, lr_cb=lr_cb,
                 tau_frac=tau_frac, use_delta3=use_delta3,
                 freeze_codebook=freeze_codebook, freeze_scale=freeze_scale,

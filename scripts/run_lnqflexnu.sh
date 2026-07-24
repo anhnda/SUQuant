@@ -61,6 +61,17 @@ EVAL_EVERY=${EVAL_EVERY:-1}
 # Break the delta2=0 fixed point. 0.0 = exact FlexRound init.
 DELTA_NOISE=${DELTA_NOISE:-0.0}
 
+# ---- signed G ---------------------------------------------------------------
+# G = exp(gamma+) - exp(gamma-) replaces the positive divisor exp(-delta2).
+# The positive form CANNOT change sign, so it spans only sign-preserving
+# reassignments. Measured on Llama-3.2-1B layer 0: of LNQ's 22.33% non-nearest
+# choices, 29% cross zero and are unreachable -- 3.53% of weights costing ~33%
+# energy, because a sign crossing is the strongest available cancellation.
+# Signed G reaches 100% of targets.
+SIGNED_G=${SIGNED_G:-true}
+SIGNED_EPS=${SIGNED_EPS:-0.05}   # flip resistance; damping = (1+eps)/eps = 21x
+LAMBDA_TV=${LAMBDA_TV:-0.0}      # TV penalty: shrinks toward G=0, not toward flip
+
 FREEZE_CB=false
 FREEZE_SC=false
 case "${CELL:-D}" in
@@ -86,6 +97,9 @@ python layerwise_nuq.py "$MODEL_PATH" \
   --flexnu_stage_frac "$STAGE_FRAC" \
   --flexnu_eval_every "$EVAL_EVERY" \
   --flexnu_delta_init_noise "$DELTA_NOISE" \
+  --flexnu_signed_g "$SIGNED_G" \
+  --flexnu_signed_eps "$SIGNED_EPS" \
+  --flexnu_lambda_tv "$LAMBDA_TV" \
   --flexnu_freeze_codebook "$FREEZE_CB" \
   --flexnu_freeze_scale "$FREEZE_SC" \
   $MODE_OPT
