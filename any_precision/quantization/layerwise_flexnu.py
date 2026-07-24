@@ -332,7 +332,8 @@ def _optimize_rows(
                     best_state = (anchor.detach().clone(), gaps.detach().clone(),
                                   delta2.detach().clone(),
                                   None if delta3 is None else delta3.detach().clone())
-
+        print(f"  n_steps={n_steps} best_e={best_e:.6e} e_init={e_init:.6e} "
+                  f"restored={'best' if best_state is not None else 'init'}", flush=True)
         if best_state is not None:
             with torch.no_grad():
                 anchor.copy_(best_state[0]); gaps.copy_(best_state[1])
