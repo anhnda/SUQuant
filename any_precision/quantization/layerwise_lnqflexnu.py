@@ -63,7 +63,6 @@ from typing import Tuple
 import numpy as np
 import torch
 
-from .layerwise_quantize import train_least_squares
 from .layerwise_flexnu import (
     _optimize_rows,
     objective_lnq_scale,
@@ -127,6 +126,8 @@ def train_lnq_flexnu(
         t_lnq = 0.0
         logging.info("[lnq+flexnu] stage 1 SKIPPED (skip_lnq=True)")
     else:
+        from .layerwise_quantize import train_least_squares
+
         t0 = time.time()
         lnq_labels, lnq_C, lnq_log = train_least_squares(
             W, init_labels, init_centroids, H,
