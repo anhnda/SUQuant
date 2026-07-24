@@ -1,284 +1,416 @@
-<p align=center>
-<div align=center>
-<a href="https://jinukkim.me/blog/guidedquant/">
-<img src="assets/guidedquant-logo.png" width=350>
-</a>
-</div>
-<h1 align="center">GuidedQuant</h1>
-</p>
-<p align="center"><b>Smarter LLM Post-Training Quantization using End Loss Guidance</b>, boosting the performance of <br> state-of-the-art <i>weight-only scalar</i>, <i>weight-only vector</i>, and <i>weight-and-activation</i> quantization methods.</p>
-<p align="center">
-<a href="https://arxiv.org/abs/2505.07004"><img src="https://img.shields.io/badge/arXiv-2505.07004-b31b1b.svg"></a>
-<a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-orange"></a>
-<a href="https://jinukkim.me/blog/guidedquant/"><img src="https://img.shields.io/badge/Blog-GuidedQuant-blue"></a>
-<a href="https://drive.google.com/file/d/1L5GSu4ogS2P3WWU1fqJELttgOXHUd5Jt/view"><img src="https://img.shields.io/badge/Poster-GuidedQuant-green"></a>
-<a href="https://huggingface.co/collections/jusjinuk/instruction-tuned-models-guidedquant-68334269c44cd3eb21f7bd61"><img src="https://img.shields.io/badge/Models-HuggingFace-yellow"></a>
-</p>
+<h1 align="center">FlexNu</h1>
 
-# News
-- **May, 2025**: GuidedQuant is accepted to **ICML 2025**.
-
-# Overview
-![Light Mode](assets/objective-light.png#gh-light-mode-only)
-![Dark Mode](assets/objective-dark.png#gh-dark-mode-only)
-
-> *<b>GuidedQuant</b> enhances LLM quantization by integrating gradient information from the end loss into the quantization objective, boosting the performance of SOTA weight-only scalar, weight-only vector, and weight-and-activation quantization. Additionally, we introduce <b>LNQ</b>, a non-uniform scalar quantization algorithm which is guaranteed to monotonically decrease the quantization objective value.*
-
-# Installation 
-
-1. Install the requirements (we used Python 3.11 / CUDA 12.4 / pip 25.1 version).
-      ```bash
-      pip install -r requirements.txt
-      ```
-2. Install the Any-Precision-LLM CUDA kernels.
-
-      Install either from source (this might take a while),
-      ```bash
-      cd inference/ap_gemv
-      bash install.sh
-      ```
-      or from pre-built binaries,
-      ```bash
-      # CUDA 12.4
-      pip install ap-gemv -i https://jinukkim.me/whl/cu124
-      ```
-
-
-
-# Pre-quantized Models
-
-| Type | Models | 🤗 Hugging Face |
-|:---|:---|:---|
-| Instruction-tuned models | `Qwen3-32B`, `gemma-3-27b-it`, `Llama-3.1-8B-Instruct`,`Llama-3.1-70B-Instruct`, `Llama-3.3-70B-Instruct`, `Llama-3.2-1B-Instruct`, `Llama-3.2-3B-Instruct` | **[Link](https://huggingface.co/collections/jusjinuk/instruction-tuned-models-guidedquant-68334269c44cd3eb21f7bd61)** |
-|Pre-trained models | `Llama-2-7b-hf`, `Llama-2-13b-hf`, `Llama-2-70b-hf`, `Meta-Llama-3-8B`, `Meta-Llama-3-70B` | **[SqueezeLLM](https://huggingface.co/collections/jusjinuk/pre-trained-models-squeezellm-682ca2b6d71351d9bd94e94d)**, <br> **[LNQ](https://huggingface.co/collections/jusjinuk/pre-trained-models-lnq-682c879c799d0ba767b57216)**, <br> **[LNQ+GuidedQuant](https://huggingface.co/collections/jusjinuk/pre-trained-models-lnq-gquant-682c89b60907f4a88caf6fa3)**, <br> **[QTIP+GuidedQuant](https://huggingface.co/collections/jusjinuk/pre-trained-models-qtip-gquant-685396d5b5537d0bee74d1e2)** |
-
-## Quick Start
-
-<div align="center">
-<img src="assets/demo.png" width=600>
-</div>
-
-You could easily load and test them using `AnyPrecisionForCausalLM` class, as shown in the following example (runs on one RTX 3090).
-
-```python
-from any_precision.modules.AnyPrecisionForCausalLM import AnyPrecisionForCausalLM
-from transformers import AutoTokenizer, TextStreamer
-import torch
-
-quantized_model_name = "jusjinuk/Llama-3.3-70B-Instruct-2bit-GuidedQuant-LNQ"
-# Use float16 for Llama models, and bfloat16 for Qwen / Gemma models
-dtype = torch.float16 if "llama" in quantized_model_name.lower() else torch.bfloat16
-
-model = AnyPrecisionForCausalLM.from_quantized(quantized_model_name, torch_dtype=dtype)
-tokenizer = AutoTokenizer.from_pretrained(quantized_model_name)
-streamer = TextStreamer(tokenizer)
-
-prompt = "Write me a short and concise story about Harry, Ron, and Hermione.\n"
-chat = [
-    {"role": "system", "content": "You are a helpful assistant.\n"},
-    {"role": "user", "content": prompt},
-]
-
-inputs = tokenizer.apply_chat_template(
-    chat, tokenize=True, return_tensors="pt", add_generation_prompt=True
-).to(model.device)
-
-model.generate(inputs, 
-    max_new_tokens=200, do_sample=False, temperature=1.0, streamer=streamer, pad_token_id=tokenizer.eos_token_id
-)
-```
-
-# Inference Speed-up
-
-We provide a simple [inference script (~80 LOC)](./inference_example.py) that uses `torch.compile` with Hugging Face `generate` function, showing the speed-up of LNQ + GuidedQuant quantized model, using Any-Precision-LLM kernel (`ap-gemv` kernel). This example is inspired by the demo code of [Any-Precision-LLM](https://github.com/SNU-ARC/any-precision-llm).
-```bash
-# pre-trained Llama-3.1-8B-Instruct
-# ~43 tok/s in one RTX 3090
-python inference_example.py
-
-# LNQ + GuidedQuant quantized Llama-3.1-8B-Instruct (bits=2)
-# ~130 tok/s in one RTX 3090
-python inference_example.py -q
-```
-
-In the paper, we report the further-optimized throughput of each model obtained by fusing the Q/K/V layer and the Up/Gate layer within every Transformer block.
-
-<details>
-<summary><i>Click to expand the commands for reproducing the throughput results in the paper.</i></summary>
-<br>
-
-First, do `cd inference/`, and then
-
-1. For quantized models, run
-      ```bash
-      # SqueezeLLM models
-      python sqllm_llama_convert_fuse.py --ckpt_dir <path_to_quantized_ckpt> --bitwidth <bitwidth>
-      python generate.py --compile 2 --num_samples 5 \
-            --model_name ${model} --bitwidth ${BITWIDTH} --dtype "float16" \
-            --checkpoint_path ${checkpoint_path} \
-            --backend ap --max_new_tokens 100
-   
-      # QTIP models
-      # Make sure you have installed the QTIP kernels (../qtip/) 
-      # and fast-hadamard-transform (https://github.com/Dao-AILab/fast-hadamard-transform).
-      python qtip_llama_convert_no_fuse.py --ckpt_dir <path_to_quantized_ckpt>
-      python generate.py --compile 2 --num_samples 5 \
-            --model_name ${model} --bitwidth ${BITWIDTH} --dtype "float16" \
-            --checkpoint_path ${checkpoint_path} \
-            --backend qtip --max_new_tokens 100
-      
-      ```
-
-2. For pre-trained models (without quantization), run
-      ```bash
-      python pt_llama_convert_fuse.py --ckpt_dir <save_path> --model_name <huggingface_model_name>
-      python generate.py --compile 2 --num_samples 5 \
-            --model_name ${model} --bitwidth 16 --dtype "float16" \
-            --checkpoint_path ${checkpoint_path} \
-            --max_new_tokens 100
-      ```
-</details>
-
-# Usage
-
-## Download the calibration data
-We provide the tokenized calibration data for Llama-2 and Llama-3 to reproduce the results in the paper.
-```bash
-bash scripts/download_calibration.sh
-```
-
-
-## Weight-only scalar quantization (SqueezeLLM, LNQ + GuidedQuant)
-Below command saves the weight gradients and activation gradients (averaged into $NUM_GROUPS groups) and quantizes model with SqueezeLLM.
-```bash
-bash scripts/run_sqllm.sh $MODEL_NAME $BITS $NUM_GROUPS
-# e.g., bash scripts/run_sqllm.sh meta-llama/Llama-2-7b-hf 2 4
-```
-<!-- **Note**:  -->
-
-Afterwards, for LNQ + GuidedQuant, run the following command.
-```bash
-bash scripts/run_lnq.sh $MODEL_NAME $BITS $NUM_GROUPS
-# e.g., bash scripts/run_lnq.sh meta-llama/Llama-2-7b-hf 2 4
-```
-<!-- **Note**:  -->
-
-> [!Note]
-> - The gradient extraction step in `scripts/run_sqllm.sh` requires:
->   - 0.3 hrs on 1 A100 GPU for Llama-2-7B
->   - 0.6 hrs on 2 A100 GPUs for Llama-2-13B
->   - 2.7 hrs on 6–7 A100 GPUs for Llama-2-70B
->
->   The script automatically splits the model across available GPUs. To run gradient extraction separately, use the `-m gradients` option, then re-run `scripts/run_sqllm.sh`.
-> - The Hessian collection step in `scripts/run_lnq.sh` runs on a single RTX3090 GPU and speeds up linearly with more visible GPUs. To run it separately, add the `-m hessians` option and re-run `scripts/run_lnq.sh`.
-> - Other than gradient extraction and Hessian collection, the rest of the quantization script runs on a single RTX3090 GPU.
-> - For Llama-2 and Llama-3 pre-trained models, you can download pre-computed Hessian files from [this Hugging Face collection](https://huggingface.co/collections/jusjinuk/guidedquant-hessians-saliency-682c9e4362cadf615f34a74f). Remove the prefix `hessians-` from the file names, and place them in the `cache/hessians` directory, and run `scripts/run_lnq.sh` file as above.
-
-We currently support the following models: **Qwen3 (dense), Gemma3, Llama 3, and Llama 2**.
-To add support for other models, you will need to modify (but are not limited to) the following directories:
-- `any_precision/analyzer/architectures/`
-- `any_precision/analyzer/splitted_models/`
-
-## Weight-only vector / Weight-and-activation quantization 
-
-<details>
-<summary><i>Click to expand the commands for reproducing the results in the paper.</i></summary>
-<br>
-
-Currently, this section is only tested on Llama model family. 
-
-### Dependencies & Preparation
-
-To reproduce weight-only vector & weight-and-activation quantization results, install the following dependencies.
-```bash
-git clone https://github.com/Dao-AILab/fast-hadamard-transform 
-cd fast-hadamard-transform
-pip install .
-cd ..
-cd qtip/qtip-kernels
-pip install .
-cd ../..
-```
-
-Also, you should downgrade the version of `transformers`.
-```bash
-pip install transformers==4.45.2
-```
-
-You need to have the GuidedQuant Hessian and saliency files generated using the commands from the **Weight-only scalar quantization** section, located in the `cache/hessians` and `cache/saliency` directories.
-Note that QTIP uses the [RedPajama (1024 × 4096)](https://github.com/snu-mllab/GuidedQuant/releases/download/v1.0.0/Llama-2-7b-hf-redpajama_s1024_blk4096.pt) for calibration, while SpinQuant uses [WikiText2 (128 × 2048)](https://github.com/snu-mllab/GuidedQuant/releases/download/v1.0.0/Llama-2-7b-hf-wikitext2_s128_blk2048.pt).
-
-Alternatively, you can download pre-computed Hessian and saliency files from [this Hugging Face collection](https://huggingface.co/collections/jusjinuk/guidedquant-hessians-saliency-682c9e4362cadf615f34a74f).
-Remove the prefix `hessians-` and `saliency-` from the file names, and place them in the `cache/hessians` and `cache/saliency` directories, respectively.
-These files correspond to the calibration data that is downloaded when running `bash scripts/download_calibration.sh`.
-
-### Reproduce the results of QTIP + GuidedQuant
-
-Run the following command to reproduce the results of QTIP + GuidedQuant.
-```bash
-cd qtip
-# Example: bash exps/lufree_noft_qtip.sh 1mad 7b 2
-bash exps/lufree_noft_qtip.sh $METHOD $MODEL_SIZE $BITS
-```
-
-### Reproduce the results of SpinQuant + GuidedQuant
-
-First, download the rotation matrices from the [SpinQuant GitHub repository](https://github.com/facebookresearch/SpinQuant) and place them in the `spin_quant/rotation/` directory. You can access the matrices directly via [this Google Drive link](https://drive.google.com/drive/folders/1R2zix4qeXBjcmgnJN1rny93cguJ4rEE8).
-
-Run the following command to reproduce Llama-2-7B results.
-```bash
-cd spin_quant
-# Example: bash scripts/2_eval_ptq_guided_save_wikitext2_7b_g1.sh meta-llama/Llama-2-7b-hf 4 4 4 "rotation/7B_W16A4KV4_lr_1.5_seed_0/R.bin"
-bash scripts/2_eval_ptq_guided_save_wikitext2_7b_g1.sh $MODEL_NAME $W_BITS $A_BITS $KV_BITS $ROTATION_PATH
-```
-
-See the full commands for reproducing the results in the paper in [scripts/2_eval_spinquant_quant_guided_g1.sh](./spin_quant/scripts/2_eval_spinquant_quant_guided_g1.sh).
-
-
-</details>
-
-
-
-
-## Evaluation
-
-Run the following command to evaluate the perplexity of the pre-trained / quantized / pre-quantized models.
-```bash
-python run_eval.py
-```
-
-Add `--downstream` option to evaluate on downstream tasks using `lm-eval-harness` library.
-
+<p align="center"><b>Loss-Aware Non-Nearest Assignment for Non-Uniform Weight Quantization</b><br>
+Built on <a href="https://arxiv.org/abs/2505.07004">GuidedQuant</a>'s end-loss-guided objective.</p>
 
 ---
-#### Comparison results with [YAQA](https://arxiv.org/abs/2505.22988)
 
-YAQA is a more recent quantization method that approximates the Fisher information matrix using Kronecker-decomposed matrices. Compared to GuidedQuant, YAQA achieves better performance but requires more GPU resources to quantize a model (e.g., approximately 6 hours on 8×H100 GPUs for the Llama-2-7B model).
+## What this is
 
-Evaluation results based on the experimental setup described in their paper are summarized in this [table](https://docs.google.com/spreadsheets/d/1Gm27k6ZiomUSYK9UFy_wbvgiRmrJCR_Qjywsmvj-NOE/edit?usp=sharing).
+Non-uniform weight quantizers fit a scalar codebook to the weight distribution and
+then assign each weight to its **nearest** codeword. That rule is not optimal for
+the objective these methods actually minimize — layer output reconstruction — and
+the gap is governed entirely by the off-diagonal structure of the Hessian.
 
-# Acknowledgement
-This code is heavily based on the following repositories:
-- [Any-Precision-LLM](https://github.com/SNU-ARC/any-precision-llm)
-- [QTIP](https://github.com/Cornell-RelaxML/qtip)
-- [SpinQuant](https://github.com/facebookresearch/SpinQuant)
-- [AQLM](https://github.com/Vahe1994/AQLM)
-- [Fast Hadamard Transform](https://github.com/Dao-AILab/fast-hadamard-transform)
-- [gpt-fast](https://github.com/pytorch-labs/gpt-fast)
+FlexNu keeps the codebook and the bit-rate exactly as they are, and changes only
+the assignment. Following FlexRound, a learned element-wise divisor perturbs the
+*query* but not the *reconstruction*, so the committed weight need not be the
+nearest codeword. The divisor is training-time only and is discarded at commit.
 
-We thank the authors for their open-source implementations and contributions to the community.
+The enabling observation is that **scalar codebooks are sorted**, so
+nearest-codeword assignment is exactly a monotone step function of the query with
+thresholds at codeword midpoints:
 
-# Citation
+$$\hat{w} = c_0 + \sum_{j} \mathbf{1}[\,q > t_j\,]\,\Delta_j,
+\qquad t_j = \tfrac{1}{2}(c_j + c_{j+1}),\quad \Delta_j = c_{j+1}-c_j > 0.$$
 
-Please cite our paper if you find our work useful:
+The forward pass uses the hard indicator — it *is* nearest-codeword assignment, no
+relaxation. The backward pass substitutes a logistic bump. Because the map is
+monotone, this straight-through estimator is consistent, with no softmax, no
+temperature annealing, and no codebook collapse.
+
+**What FlexNu contributes here** is the solver. **GuidedQuant contributes the
+objective**: instead of the plain layer Gram $X^\top X$, we optimize against the
+saliency-weighted Hessian $H_k = X^\top \mathrm{Diag}(s_k) X$, where $s_k$ is the
+squared end-loss gradient averaged over a group of output channels. FlexNu's
+escape is therefore aimed at *loss* reduction rather than *output* reduction.
+
+> [!IMPORTANT]
+> **This is a research prototype with unpublished results.** The synthetic
+> validation is in the paper draft; real-model numbers are not yet established.
+> Everything below is protocol, and the ablation ladder in
+> [Validating a run](#validating-a-run) is not optional — cell A is a correctness
+> check that must pass before any perplexity number means anything.
+
+---
+
+## When it helps, and when it provably does not
+
+**Proposition 1.** *If $H_k$ is diagonal, the objective separates across input
+coordinates and nearest-codeword assignment is provably optimal.*
+
+Two consequences worth internalizing before running anything:
+
+- **FlexNu buys exactly nothing when $H_k$ is well-conditioned.** This is a
+  property of the objective, not a limitation of the implementation. The gain
+  should track $\kappa(H_k)$; if it does not, the mechanism is falsified.
+- **SqueezeLLM's objective cannot host this method.** It minimizes a *diagonal*
+  Fisher, where Proposition 1 makes any non-nearest move strictly worse.
+  SqueezeLLM's role here is initialization only.
+
+The comparison target is **LNQ**, GuidedQuant's own solver. LNQ alternates a
+closed-form codebook update with coordinate descent, and its CD step rounds to
+nearest by construction — so every point LNQ can reach is a nearest-codeword map
+of some codebook. It is a strong in-set solver. FlexNu is not a better search of
+that set; it targets a different reachable set.
+
+---
+
+## Installation
+
+Python 3.11 / CUDA 12.4 / pip 25.1.
+
+```bash
+pip install -r requirements.txt
+```
+
+Then the Any-Precision-LLM CUDA kernels, either from source
+
+```bash
+cd inference/ap_gemv && bash install.sh
+```
+
+or pre-built:
+
+```bash
+pip install ap-gemv -i https://jinukkim.me/whl/cu124   # CUDA 12.4
+```
+
+---
+
+## Quick start
+
+Four steps. Each reuses the previous one's cache, so the order matters.
+
+```bash
+MODEL=Llama-3.2-1B
+BITS=3
+G=1                      # GuidedQuant's output-channel group count
+
+# 1. SqueezeLLM init -- REQUIRED, not optional.
+#    Writes cache/quantized/, the source of init_labels + init_centroids for
+#    BOTH solvers. For FlexNu it also seeds the best-iterate incumbent, i.e.
+#    the floor guaranteeing the result is never worse than nearest-codeword.
+#    The pipeline hard-returns without it ("Need to provide it").
+bash scripts/run_sqllm.sh $MODEL $BITS $G
+
+# 2. GuidedQuant Hessians -- solver-independent, cache once and share.
+bash scripts/run_lnq.sh $MODEL $BITS $G -m hessians
+
+# 3. LNQ baseline (cell E) -- the number FlexNu has to beat.
+bash scripts/run_lnq.sh $MODEL $BITS $G
+
+# 4. FlexNu.
+bash scripts/run_flexnu_gq.sh $MODEL $BITS $G
+```
+
+Step 2 is optional as a separate call — step 3 would produce the Hessians anyway
+— but it is the expensive amortizable part, and splitting it out means a failure
+in step 3 does not cost you the Hessian pass.
+
+### Evaluate
+
+Dequantize to a dense HF checkpoint, then measure perplexity:
+
+```bash
+# LNQ baseline
+python dequant_to_hf.py \
+    cache/layerwise_packed/layerwise-$MODEL-w$BITS-c4_s128_blk2048_g${G}_iter3_cd4 \
+    cache/dense/${MODEL}-w${BITS}-lnq
+python eval_ppl.py --model-path cache/dense/${MODEL}-w${BITS}-lnq \
+    --datasets wikitext2 c4 --seqlen 2048 --dtype fp16
+
+# FlexNu -- note the _flexnu suffix
+python dequant_to_hf.py \
+    cache/layerwise_packed/layerwise-$MODEL-w$BITS-c4_s128_blk2048_g${G}_iter3_cd4_flexnu \
+    cache/dense/${MODEL}-w${BITS}-flexnu
+python eval_ppl.py --model-path cache/dense/${MODEL}-w${BITS}-flexnu \
+    --datasets wikitext2 c4 --seqlen 2048 --dtype fp16
+```
+
+> [!WARNING]
+> **Check the two packed paths differ only by `_flexnu`.** If they differ in the
+> *model name* as well, one of the runs predates the `--model_name` fix and you
+> are comparing artifacts from different pipeline states. See
+> [Cache paths](#cache-paths-and-the-model_name-flag).
+
+For Llama-3.2-1B you should see **112 quantized modules and 35 unquantized
+tensors** — 7 projections × 16 layers, with layernorms, embeddings, `model.norm`,
+and `lm_head` left in fp16. This is identical for LNQ and FlexNu; both read the
+same `module_names` from `any_precision/analyzer/architectures/llama.yaml`. If
+the two runs disagree, something is wrong.
+
+---
+
+## Validating a run
+
+Do this before trusting any perplexity number.
+
+### 1. Did FlexNu actually run?
+
+```bash
+grep -c "\[flexnu\]" logs_layer/*_flexnu_*.txt      # must be > 0
+grep -m3 "\[flexnu\]" logs_layer/*_flexnu_*.txt
+```
+
+That log line is emitted only from inside `train_flexnu`. Zero hits means the
+solver was never reached — check for `Need to provide it` or `already exists and
+is not empty` in the log, and note that tracebacks go to **stdout**, not the log
+file:
+
+```bash
+bash scripts/run_flexnu_gq.sh $MODEL $BITS $G 2>&1 | tail -40
+```
+
+### 2. The diagnostic that matters
+
+Each `[flexnu]` line reports `moved=`, the fraction of weights whose committed
+index differs from the nearest-codeword index. **This is the direct measurement
+of the paper's claim.** If it is near zero on real layers, the escape is not
+happening and any perplexity difference came from somewhere else.
+
+### 3. The ablation ladder
+
+Set `CELL` to select a rung.
+
+| Cell | Command | Codebook | Divisor | Isolates |
+|:--|:--|:--|:--|:--|
+| **E** | `run_lnq.sh` | LNQ | — | baseline, **the number to beat** |
+| **A** | `CELL=A run_flexnu_gq.sh` | frozen | frozen | correctness check |
+| **B** | `CELL=B run_flexnu_gq.sh` | learned | frozen | fitting $W$ |
+| **C** | `CELL=C run_flexnu_gq.sh` | frozen | learned | escaping via the loss |
+| **D** | `CELL=D run_flexnu_gq.sh` | learned | learned | joint (default) |
+
+**Cell A is not a result.** It sets $T=0$ and commits `searchsorted` on the
+initialization codebook, so `E_init` and `E_final` in its log must be identical.
+Any deviation is a fault in the Hessian handoff or the codebook layout — stop and
+debug.
+
+Note that A does **not** reproduce E. E is converged LNQ, which is substantially
+better than the SqueezeLLM initialization A commits. The scientific comparison is
+**B versus C**.
+
+### 4. The falsification test
+
+Proposition 1 predicts the gain tracks $\kappa(H_k)$. Compute it per layer
+directly from the cached Hessians — no quantization run needed, seconds of
+eigendecomposition — and correlate with per-layer `energy_rel_drop`. A null or
+negative correlation falsifies the mechanism as stated.
+
+A second measurement is specific to this combination. Compare $\kappa(H_k)$
+against $\kappa(X^\top X)$, the latter obtainable from the same pipeline with
+`--is_nosal true`:
+
+- If saliency reweighting **increases** anisotropy, $H_k$ is a better substrate
+  for FlexNu than the plain Gram — the whole argument for combining them.
+- If it **flattens** the spectrum, expect FlexNu to underperform here relative to
+  the plain layer-wise objective, and the honest conclusion is that the two
+  techniques compete rather than compose.
+
+This is cheap and it is worth running *before* spending GPU-hours.
+
+---
+
+## Tuning
+
+All settings are environment variables read by `scripts/run_flexnu_gq.sh`.
+
+| Variable | Default | Notes |
+|:--|:--|:--|
+| `ITERS` | `300` | Adam steps per row-block |
+| `LR_SCALE` | `3e-3` | divisor learning rate |
+| `LR_CB` | `1e-5` | codebook learning rate — **deliberately tiny** |
+| `ROW_BLOCK` | `64` | memory knob; does not change the result |
+| `TAU_FRAC` | `0.5` | backward-only STE width, as a fraction of mean gap |
+| `STAGE_FRAC` | `0.0` | **leave at 0** — see below |
+| `EVAL_EVERY` | `1` | **leave at 1** — see below |
+| `CELL` | `D` | ablation rung |
+
+### Three settings that are not free parameters
+
+**`LR_CB` must stay far below `LR_SCALE`.** Raising it degrades results
+monotonically past roughly $10^{-4}$: the codebook chases $W$ and drags the
+thresholds out from under the divisor. Whether that cliff moves under $H_k$ —
+where the codebook chases *loss-weighted* $W$ instead — is the most informative
+single sweep available here, and is unresolved.
+
+**`STAGE_FRAC=0` (joint) is not a default, it is a requirement.** Staging the
+divisor after the codebook starts $\delta_2 = 0$ on a grid already fitted to $W$
+— precisely the nearest-neighbour point the divisor exists to escape — and it
+must then climb out. Full staging collapses the effect. The flag exists for the
+ablation only.
+
+**`EVAL_EVERY=1` is not tunable in practice.** The hard energy is
+piecewise-constant and non-monotone along the STE trajectory: good assignments
+appear and vanish within a few steps. Subsampling misses them and the best-iterate
+guard then falls back to initialization. This roughly doubles per-step cost and
+that cost is not optional.
+
+### Memory
+
+The STE forward materializes a `[row_block, d_in, K-1]` tensor and autograd
+retains several. At `d_in=11008`, `K=8` (3-bit), fp32: 4.9 MB per tensor at
+`ROW_BLOCK=16`, 39 MB at 128, with four to six live copies through the backward.
+4-bit (`K=16`) roughly doubles it. Raise `ROW_BLOCK` until memory binds — rows are
+independent given their group's Hessian, so it changes peak memory only.
+
+---
+
+## Design notes
+
+### The best-iterate guard records, it never constrains
+
+The STE gradient is exact for the *smoothed* objective, not the piecewise-constant
+true one, so iterates keep moving after the hard energy bottoms out and momentum
+walks them uphill. The last iterate is essentially never the best, so snapshotting
+is necessary.
+
+The subtlety: escaping nearest-neighbour requires **crossing** a threshold, and a
+crossing is a transient in which the smoothed objective improves while the hard
+energy briefly worsens. A guard that rejects, clips, or rewinds to such iterates
+filters out exactly the moves the method depends on. Ours lets the optimizer run
+unconstrained and only records what it passes through. The SqueezeLLM
+initialization seeds the incumbent, so the committed result is never worse than
+nearest-codeword — a floor on the *output*, not a leash on the *search*.
+
+### Codebook width is forced to full row
+
+`pack.py` reads `layer_lut[name][r_idx][0]`, with the accompanying comment that
+the index assumes a single group: the Any-Precision-LLM kernel stores exactly one
+codebook of $2^b$ entries per output row, spanning the full input dimension.
+Block-wise codebooks are not representable in this format, so there is no
+block-size flag.
+
+This costs codebook expressiveness relative to a block-wise setup — one codebook
+covers $d_{\text{in}}$ weights rather than 64 — but it is exactly what SqueezeLLM
+and LNQ already do here, so the comparison is like-for-like and the bit-rate is
+identical. Expect the synthetic magnitudes from the paper draft not to transfer.
+
+### No Cholesky
+
+LNQ factorizes $H_k$ for its closed-form codebook solve, which costs
+$O(d_{\text{in}}^3)$ and requires positive *definiteness* — the reference
+implementation escalates a damping factor and aborts if it cannot achieve it.
+FlexNu touches $H_k$ only through the matmul, so positive *semi*definiteness
+suffices. Both the cubic term and that failure mode disappear. A small ridge
+($10^{-5}$ relative to the mean diagonal) is retained because a semidefinite
+$H_k$ has null directions the divisor will otherwise wander into.
+
+### Sortedness is structural
+
+The codebook is parameterized as $c_0 = a$,
+$c_{j+1} = c_j + \mathrm{softplus}(g_j)$, so $\Delta_j > 0$ holds at every point
+of training with no sort, no projection, and no constraint violation. This keeps
+the reconstruction monotone (hence the STE valid) and guarantees the committed
+codebook is strictly increasing, which `searchsorted` at commit time requires.
+
+---
+
+## Cache paths and the `--model_name` flag
+
+`resolve_model.py` turns a bare model name into an HF snapshot path ending in a
+commit hash. Cache directories are derived from `basename(model_path)`, so
+without intervention they are named after that hash — which changes on every
+re-pull, silently invalidating every downstream cache.
+
+All three scripts therefore forward `--model_name "$MODEL_REF"`, the clean name
+you typed, and both pipelines respect it:
+
+```python
+model_name = model_name or model_string.split("/")[-1]
+```
+
+Resulting layout for `MODEL=Llama-3.2-1B`, `BITS=3`, `G=1`:
 
 ```
-@inproceedings{kim2025guidedquant,
-      title={GuidedQuant: Large Language Model Quantization via Exploiting End Loss Guidance}, 
-      author={Jinuk Kim and Marwa El Halabi and Wonpyo Park and Clemens JS Schaefer and Deokjae Lee and Yeonhong Park and Jae W. Lee and Hyun Oh Song},
-      booktitle = {International Conference on Machine Learning (ICML)},
-      year={2025},
-}
+cache/quantized/Llama-3.2-1B-w3_orig3-c4_s128_blk2048            <- shared init
+cache/hessians/Llama-3.2-1B-c4_s128_blk2048_g1                   <- shared Hessians
+cache/layerwise_quantized/Llama-3.2-1B-w3-...-g1_iter3_cd4         <- LNQ
+cache/layerwise_quantized/Llama-3.2-1B-w3-...-g1_iter3_cd4_flexnu  <- FlexNu
+cache/layerwise_packed/layerwise-Llama-3.2-1B-w3-...-cd4           <- LNQ
+cache/layerwise_packed/layerwise-Llama-3.2-1B-w3-...-cd4_flexnu    <- FlexNu
 ```
 
+Two facts worth knowing before sweeping:
 
+- **Precision must match** across steps 1, 3, and 4 —
+  `initialization_cache_path` embeds `w{bits}_orig{bits}`.
+- **`G` need not match between step 1 and steps 3–4.** Step 1's `--num_groups`
+  affects only the saliency cache; `quantized_cache_path` has no `g` in it. One
+  SqueezeLLM run serves every `G` downstream.
+
+> [!CAUTION]
+> The packing stage **skips silently** when its output directory exists and is
+> non-empty. A stale directory from an earlier run will be preserved and
+> evaluated, which looks exactly like "FlexNu produced identical results to LNQ."
+> When in doubt:
+> ```bash
+> rm -rf cache/layerwise_quantized/*_flexnu cache/layerwise_packed/*_flexnu cache/dense/*
+> ```
+
+---
+
+## Where the code lives
+
+| Path | Role |
+|:--|:--|
+| `any_precision/quantization/layerwise_flexnu.py` | the solver — `train_flexnu` |
+| `any_precision/quantization/layerwise_quantize.py` | dispatch; LNQ's `train_least_squares` |
+| `any_precision/quantization/layerwise_main.py` | pipeline, cache paths |
+| `any_precision/quantization/activations.py` | saliency-weighted Hessian accumulation |
+| `scripts/run_flexnu_gq.sh` | runner + ablation ladder |
+
+`train_flexnu` has the same signature and return as LNQ's `train_least_squares`,
+so the two are interchangeable behind a one-line branch in `seed_layer`.
+
+---
+
+## Limitations
+
+**Scope.** No benefit when $H_k$ is well-conditioned (Proposition 1). This
+delimits where the method should be deployed.
+
+**Rotation.** Incoherence processing (QuIP, QuaRot, SpinQuant) improves Gram
+conditioning, which by Proposition 1 would reduce available headroom. Whether
+rotation and FlexNu compose or compete is open, and is arguably the most important
+question this work raises.
+
+**Cost.** Substantially more expensive at quantization time than one-shot
+methods: full $H_k$ per layer plus $T$ optimization steps per row-block, with
+mandatory per-step energy evaluation. Inference cost and bit-rate are unchanged.
+
+**No convergence guarantee.** LNQ is a descent method with a proof. The STE
+trajectory here is non-monotone in the true objective; the guard makes results
+reproducible and bounds them below by nearest-codeword, but the method remains
+sensitive to `LR_SCALE` in a way we have not fully characterized.
+
+**Scalar only.** The sortedness argument does not extend to unordered vector
+codebooks (E8 lattices, AQLM's additive books), where the Voronoi topology is the
+obstruction. Trellis-structured codebooks, being ordered along the chain, look
+more promising.
+
+---
+
+## Acknowledgements
+
+This work builds directly on **GuidedQuant** ([paper](https://arxiv.org/abs/2505.07004),
+[code](https://github.com/snu-mllab/GuidedQuant)), whose saliency-weighted
+objective and LNQ solver are the foundation and the baseline here. It also builds
+on **FlexRound** (Lee et al., ICML 2023) for the divisor mechanism,
+**SqueezeLLM** for initialization, and **Any-Precision-LLM** for the inference
+kernels.
+
+Model support (**Qwen3 dense, Gemma3, Llama 3, Llama 2**) is inherited from
+GuidedQuant. To add architectures, modify
+`any_precision/analyzer/architectures/` and
+`any_precision/analyzer/splitted_models/`.
