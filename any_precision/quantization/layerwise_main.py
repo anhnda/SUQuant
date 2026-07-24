@@ -39,6 +39,8 @@ def layerwise_nuq(
         sub_qlayer=None,
         is_nosal=False,
         model_name=None,
+        solver="lnq",
+        flexnu_kwargs=None,
 ):
 
     # ------------------- Set cache paths -------------------
@@ -60,13 +62,16 @@ def layerwise_nuq(
                           f"{model_name}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{'_nosal' if is_nosal else ''}")
 
+    _slv = "" if solver == "lnq" else f"_{solver}"
     quantized_cache_path = (f"{cache_dir}/layerwise_quantized/"
                           f"{model_name}-w{seed_precision}"
-                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}")
-
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}"
+                          f"_iter{num_iterations}_cd{cd_cycles}"
+                          f"{'_nosal' if is_nosal else ''}{_slv}")
+    
     model_output_path = (f"{cache_dir}/layerwise_packed/"
                          f"layerwise-{model_name}-w{seed_precision}"
-                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}")
+                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}{_slv}")
 
 
     # Logging with time sans date, level name, and message

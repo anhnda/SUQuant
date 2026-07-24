@@ -10,6 +10,7 @@ from typing import List, Tuple, Literal, Optional
 import time
 
 from .utils import get_progress_bar
+from .layerwise_flexnu import train_flexnu
 
 @torch.no_grad()
 def objective_function(
@@ -307,6 +308,8 @@ def seed_layer(
     group_count: int,
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    solver: str = "lnq",
+    flexnu_kwargs: dict = None,
 ) -> Tuple[List[List[np.ndarray]], List[np.ndarray]]:
     lut_by_bit_by_module = []
     parent_weights_by_modules = []
@@ -338,8 +341,16 @@ def seed_layer(
         init_centroids = module_init_centroids.reshape(output_dim, n_cluster) # Shape: (output_dim, n_cluster)
         reshaped_module_weight = module_weight.reshape(output_dim, input_dim) # Shape: (output_dim, input_dim)
 
-        labels, C, log_dict = train_least_squares(reshaped_module_weight, init_labels, init_centroids, module_hessian, num_iterations=num_iterations, cd_cycles=cd_cycles)
-
+        if solver == "flexnu":
+            labels, C, log_dict = train_flexnu(
+                reshaped_module_weight, init_labels, init_centroids,
+                module_hessian, **(flexnu_kwargs or {}),
+            )
+        else:
+            labels, C, log_dict = train_least_squares(
+                reshaped_module_weight, init_labels, init_centroids,
+                module_hessian, num_iterations=num_iterations, cd_cycles=cd_cycles,
+            )
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
         labels = labels.reshape(output_dim, 1, input_dim) # Shape: (output_dim, 1, input_dim)
         C = C.reshape(output_dim, 1, n_cluster) # Shape: (output_dim, 1, n_cluster)
@@ -476,6 +487,9 @@ def seed(
     num_iterations: int = 3,
     cd_cycles: int = 4,
     sub_qlayer: Tuple[int, int] = None,
+    solver: str = "lnq",
+    flexnu_kwargs: dict = None
+
 ):
     group_count = 1
 
@@ -544,6 +558,8 @@ def seed(
                     group_count,
                     num_iterations=num_iterations,
                     cd_cycles=cd_cycles,
+                    solver=solver,
+                    flexnu_kwargs=flexnu_kwargs,
                 )
 
                 io_executor.submit(
@@ -568,6 +584,8 @@ def seed(
                 group_count,
                 num_iterations=num_iterations,
                 cd_cycles=cd_cycles,
+                solver=solver,
+                flexnu_kwargs=flexnu_kwargs,
             )
 
             layer_saver(luts_by_bit_by_module, parent_weights, log_dict, l)

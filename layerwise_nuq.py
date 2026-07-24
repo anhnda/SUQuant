@@ -42,9 +42,25 @@ if __name__ == "__main__":
                         help="Do not use GuidedQuant Hessian")
     parser.add_argument("--model_name", type=str, default=None,
                     help="Stable short name for cache paths (defaults to basename of model path)")
+    parser.add_argument("--solver", type=str, default="lnq",
+                        choices=["lnq", "flexnu"])
+    parser.add_argument("--flexnu_iters", type=int, default=300)
+    parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
+    parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)
+    parser.add_argument("--flexnu_row_block", type=int, default=64)
+    parser.add_argument("--flexnu_tau_frac", type=float, default=0.5)
+    parser.add_argument("--flexnu_stage_frac", type=float, default=0.0)
+    parser.add_argument("--flexnu_eval_every", type=int, default=1)
+    parser.add_argument("--flexnu_freeze_codebook", type=str2bool, default=False)
+    parser.add_argument("--flexnu_freeze_scale", type=str2bool, default=False)
     args = parser.parse_args()
     args.sub_hessian = tuple(args.sub_hessian) if args.sub_hessian else None
     args.sub_qlayer = tuple(args.sub_qlayer) if args.sub_qlayer else None
 
     # only pass options that are not None
-    layerwise_nuq(**{k: v for k, v in args.__dict__.items() if v is not None})
+    fk = {k[len("flexnu_"):]: v for k, v in vars(args).items()
+          if k.startswith("flexnu_") and v is not None}
+    kw = {k: v for k, v in vars(args).items()
+          if v is not None and not k.startswith("flexnu_")}
+    kw["flexnu_kwargs"] = fk
+    layerwise_nuq(**kw)
