@@ -194,6 +194,7 @@ def _optimize_rows(
     stage_frac: float,
     eval_every: int,
     lambda_s2: float,
+    delta_init_noise: float = 0.0,   # <-- add
 ) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
     """Returns (codebook [R,K], labels [R,in], e_init, e_best)."""
     R, din = Wrows.shape
@@ -232,8 +233,13 @@ def _optimize_rows(
         anchor = anchor0.detach().clone().requires_grad_(not freeze_codebook)
         gaps = gaps0.detach().clone().requires_grad_(not freeze_codebook)
         # delta2: element-wise log-divisor (FlexRound S2), init 0 -> divisor 1
-        delta2 = torch.zeros(R, din, device=dev, dtype=wdt).requires_grad_(not freeze_scale)
-        # delta3: per-output-channel log-divisor (FlexRound s3), init 0
+        # delta2: element-wise log-divisor (FlexRound S2), init 0 -> divisor 1
+        if delta_init_noise > 0:
+            delta2 = (torch.randn(R, din, device=dev, dtype=wdt)
+                      * delta_init_noise).requires_grad_(not freeze_scale)
+        else:
+            delta2 = torch.zeros(R, din, device=dev, dtype=wdt
+                                 ).requires_grad_(not freeze_scale)        # delta3: per-output-channel log-divisor (FlexRound s3), init 0
         delta3 = (torch.zeros(R, 1, device=dev, dtype=wdt).requires_grad_(not freeze_scale)
                   if use_delta3 else None)
 
@@ -375,6 +381,7 @@ def train_flexnu(
     row_block: int = 64,
     lambda_s2: float = 0.0,
     damp_hessian: bool = True,
+    delta_init_noise: float = 0.0
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """FlexNu solver for GuidedQuant Eq. (7).
 
@@ -433,6 +440,7 @@ def train_flexnu(
                 use_delta3=use_delta3, freeze_codebook=freeze_codebook,
                 freeze_scale=freeze_scale, stage_frac=stage_frac,
                 eval_every=eval_every, lambda_s2=lambda_s2,
+                delta_init_noise=delta_init_noise
             )
             C_out[r0:r1] = cb
             labels_out[r0:r1] = idx

@@ -11,7 +11,7 @@ import time
 
 from .utils import get_progress_bar
 from .layerwise_flexnu import train_flexnu
-
+from .layerwise_lnqflexnu import train_lnq_flexnu
 @torch.no_grad()
 def objective_function(
     W: torch.Tensor, 
@@ -341,16 +341,17 @@ def seed_layer(
         init_centroids = module_init_centroids.reshape(output_dim, n_cluster) # Shape: (output_dim, n_cluster)
         reshaped_module_weight = module_weight.reshape(output_dim, input_dim) # Shape: (output_dim, input_dim)
 
-        if solver == "flexnu":
-            labels, C, log_dict = train_flexnu(
+        if solver == "lnqflexnu":
+            labels, C, log_dict = train_lnq_flexnu(
                 reshaped_module_weight, init_labels, init_centroids,
-                module_hessian, **(flexnu_kwargs or {}),
+                module_hessian,
+                num_iterations=num_iterations, cd_cycles=cd_cycles,
+                **(flexnu_kwargs or {}),
             )
+        elif solver == "flexnu":
+            labels, C, log_dict = train_flexnu(...)      # unchanged
         else:
-            labels, C, log_dict = train_least_squares(
-                reshaped_module_weight, init_labels, init_centroids,
-                module_hessian, num_iterations=num_iterations, cd_cycles=cd_cycles,
-            )
+            labels, C, log_dict = train_least_squares(...)  # unchanged
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
         labels = labels.reshape(output_dim, 1, input_dim) # Shape: (output_dim, 1, input_dim)
         C = C.reshape(output_dim, 1, n_cluster) # Shape: (output_dim, 1, n_cluster)
