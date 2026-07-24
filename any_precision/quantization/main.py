@@ -81,7 +81,7 @@ def any_precision_quantize(
         logging.info("Running: [Tokens -> Gradients -> Quantize -> Pack]")
 
     model_string = model if isinstance(model, str) else model.name_or_path
-    model_name = model_string.split("/")[-1]
+    model_name = model_name or model_string.split("/")[-1]
     logging.info(f"Running Any-Precision Quantization on {model_name} with seed precision {seed_precision} and "
                  f"parent precision {parent_precision} using {dataset} for gradient calculation")
 
