@@ -132,6 +132,71 @@ def _codebook_from_params(anchor: torch.Tensor, gaps_raw: torch.Tensor) -> torch
 
 
 # --------------------------------------------------------------------------- #
+# Warm start: invert the divisor so q = W*exp(-delta2) reproduces given labels.
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def _invert_delta_for_labels(W: torch.Tensor,
+                             cb: torch.Tensor,
+                             labels: torch.Tensor,
+                             clamp: float = 20.0) -> torch.Tensor:
+    """delta2 such that searchsorted(midpoints(cb), W*exp(-delta2)) == labels.
+
+    W      : [R, din]      cb : [R, K] sorted      labels : [R, din] target cell
+
+    searchsorted returns cell k iff  lo_k < q <= hi_k, with
+        lo_k = t_{k-1}  (-inf at k=0),   hi_k = t_k  (+inf at k=K-1).
+
+    Solving lo_k < w*exp(-d) <= hi_k:
+        w > 0 (needs hi_k > 0):  log(w/hi_k) <= d <  log(w/lo_k)
+        w < 0 (needs lo_k < 0):  log(w/lo_k) <= d <  log(w/hi_k)   [lo/hi SWAP]
+
+    The swap in the negative case is because dividing an inequality by a
+    negative number flips it. Getting it wrong silently corrupts every negative
+    weight.
+
+    UNREACHABLE cells: exp(-d) > 0 always, so q keeps w's sign. A target cell on
+    the far side of zero from w cannot be reached by any divisor; those entries
+    return 0 and the weight stays at its nearest codeword. On realistic
+    near-nearest (LNQ-like) assignments this is ~1.8% of weights.
+
+    The caller MUST recompute the committed energy from the REALISED assignment
+    rather than assuming `labels` was achieved.
+    """
+    R, din = W.shape
+    K = cb.shape[-1]
+    dev, dt = W.device, W.dtype
+    BIG = torch.finfo(dt).max
+
+    th = 0.5 * (cb[:, 1:] + cb[:, :-1])                     # [R, K-1]
+    lo_all = torch.cat([torch.full((R, 1), -BIG, device=dev, dtype=dt), th], 1)
+    hi_all = torch.cat([th, torch.full((R, 1), BIG, device=dev, dtype=dt)], 1)
+
+    lo = torch.gather(lo_all, 1, labels)                    # [R, din]
+    hi = torch.gather(hi_all, 1, labels)
+
+    pos, neg = W > 0, W < 0
+    aw = W.abs()
+    eps = 1e-12
+    CL = torch.full_like(W, clamp)
+
+    # w > 0 : log(w/hi) <= d < log(w/lo)
+    d_lo_p = torch.where(hi >= BIG, -CL, torch.log(aw.clamp(min=eps) / hi.clamp(min=eps)))
+    d_hi_p = torch.where(lo > 0, torch.log(aw.clamp(min=eps) / lo.clamp(min=eps)), CL)
+
+    # w < 0 : log(w/lo) <= d < log(w/hi)   -- lo/hi swapped, magnitudes used
+    d_lo_n = torch.where(lo <= -BIG, -CL, torch.log(aw.clamp(min=eps) / (-lo).clamp(min=eps)))
+    d_hi_n = torch.where(hi < 0, torch.log(aw.clamp(min=eps) / (-hi).clamp(min=eps)), CL)
+
+    z = torch.zeros_like(W)
+    d_lo = torch.where(pos, d_lo_p, torch.where(neg, d_lo_n, z))
+    d_hi = torch.where(pos, d_hi_p, torch.where(neg, d_hi_n, z))
+
+    reachable = ((pos & (hi > 0)) | (neg & (lo < 0))) & (d_hi > d_lo)
+    d = (0.5 * (d_lo + d_hi)).clamp(-clamp, clamp)
+    return torch.where(reachable, d, z)
+
+
+# --------------------------------------------------------------------------- #
 # Objective: GuidedQuant Eq. (7), grouped.
 # --------------------------------------------------------------------------- #
 def _group_energy(Res: torch.Tensor, H_g: torch.Tensor) -> torch.Tensor:
@@ -194,7 +259,8 @@ def _optimize_rows(
     stage_frac: float,
     eval_every: int,
     lambda_s2: float,
-    delta_init_noise: float = 0.0,   # <-- add
+    use_init_labels: bool = False,
+    delta_init_noise: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
     """Returns (codebook [R,K], labels [R,in], e_init, e_best)."""
     R, din = Wrows.shape
@@ -217,29 +283,61 @@ def _optimize_rows(
     def energy(W_hat: torch.Tensor) -> torch.Tensor:
         return _group_energy(W_hat - Wrows, H_g)
 
-    # ---- baseline: hard nearest-codeword on the init codebook -------------
-    # We use searchsorted rather than the passed-in labels: the labels came
-    # from SqueezeLLM's own (diagonal-Fisher) objective and need not be the
-    # nearest-codeword assignment for cb0. Starting from nearest-codeword makes
-    # `e_init` an honest floor, and matches what LNQ's initial objective means.
+    # ---- baseline ---------------------------------------------------------
+    # use_init_labels=False (SqueezeLLM init): re-derive nearest. SqueezeLLM's
+    #   labels came from a diagonal-Fisher objective and need not be nearest for
+    #   cb0, so nearest-codeword is the honest floor.
+    # use_init_labels=True (LNQ init): LNQ's labels are CD-optimised and are
+    #   typically ~20% NON-nearest. Re-deriving nearest discards exactly what
+    #   coordinate descent bought and hands the optimiser a worse start than
+    #   LNQ's committed solution.
+    th0 = 0.5 * (cb0[:, 1:] + cb0[:, :-1])
     with torch.no_grad():
-        th0 = 0.5 * (cb0[:, 1:] + cb0[:, :-1])
-        idx0 = torch.searchsorted(th0.contiguous(), Wrows.contiguous()).clamp_(0, K - 1)
+        if use_init_labels:
+            idx0 = init_labels.clamp(0, K - 1)
+        else:
+            idx0 = torch.searchsorted(th0.contiguous(),
+                                      Wrows.contiguous()).clamp_(0, K - 1)
         e_init = float(energy(torch.gather(cb0, 1, idx0)).item())
+        best_idx0 = idx0.clone()
+
+        # Warm-start the divisor so the forward pass reproduces idx0.
+        if use_init_labels:
+            d0 = _invert_delta_for_labels(Wrows, cb0, idx0)
+            q0 = Wrows * torch.exp(-d0)
+            idx_real = torch.searchsorted(th0.contiguous(),
+                                          q0.contiguous()).clamp_(0, K - 1)
+            e_real = float(energy(torch.gather(cb0, 1, idx_real)).item())
+            n_bad = int((idx_real != idx0).sum())
+            if n_bad:
+                logging.debug(
+                    f"[flexnu] warm start: "
+                    f"{100.0 * n_bad / idx0.numel():.2f}% of target cells "
+                    f"unreachable (sign crossings); e {e_init:.4e} -> {e_real:.4e}")
+            # Honest floor: what the optimiser can actually return to.
+            e_init = e_real
+            best_idx0 = idx_real
+        else:
+            d0 = None
 
     n_steps = 0 if (freeze_codebook and freeze_scale) else int(iters)
 
     with torch.enable_grad():
         anchor = anchor0.detach().clone().requires_grad_(not freeze_codebook)
         gaps = gaps0.detach().clone().requires_grad_(not freeze_codebook)
-        # delta2: element-wise log-divisor (FlexRound S2), init 0 -> divisor 1
-        # delta2: element-wise log-divisor (FlexRound S2), init 0 -> divisor 1
-        if delta_init_noise > 0:
-            delta2 = (torch.randn(R, din, device=dev, dtype=wdt)
-                      * delta_init_noise).requires_grad_(not freeze_scale)
+        # delta2: element-wise log-divisor (FlexRound S2).
+        # Init 0 -> divisor 1 -> nearest-codeword, UNLESS warm-started from d0,
+        # in which case it starts at the value encoding LNQ's assignments.
+        if d0 is not None:
+            _d2 = d0.clone()
+            if delta_init_noise > 0:
+                _d2 = _d2 + torch.randn_like(_d2) * delta_init_noise
+        elif delta_init_noise > 0:
+            _d2 = torch.randn(R, din, device=dev, dtype=wdt) * delta_init_noise
         else:
-            delta2 = torch.zeros(R, din, device=dev, dtype=wdt
-                                 ).requires_grad_(not freeze_scale)        # delta3: per-output-channel log-divisor (FlexRound s3), init 0
+            _d2 = torch.zeros(R, din, device=dev, dtype=wdt)
+        delta2 = _d2.requires_grad_(not freeze_scale)
+        # delta3: per-output-channel log-divisor (FlexRound s3), init 0
         delta3 = (torch.zeros(R, 1, device=dev, dtype=wdt).requires_grad_(not freeze_scale)
                   if use_delta3 else None)
 
@@ -332,8 +430,7 @@ def _optimize_rows(
                     best_state = (anchor.detach().clone(), gaps.detach().clone(),
                                   delta2.detach().clone(),
                                   None if delta3 is None else delta3.detach().clone())
-        print(f"  n_steps={n_steps} best_e={best_e:.6e} e_init={e_init:.6e} "
-                  f"restored={'best' if best_state is not None else 'init'}", flush=True)
+
         if best_state is not None:
             with torch.no_grad():
                 anchor.copy_(best_state[0]); gaps.copy_(best_state[1])
@@ -341,9 +438,13 @@ def _optimize_rows(
                 if delta3 is not None:
                     delta3.copy_(best_state[3])
         elif n_steps > 0:
-            # Nothing ever beat the init: fall back to it exactly.
+            # Nothing ever beat the incumbent: fall back to it exactly.
+            # When warm-started, that means restoring d0 -- zeroing delta2 here
+            # would silently discard LNQ's assignments and commit plain
+            # nearest-codeword instead.
             with torch.no_grad():
-                anchor.copy_(anchor0); gaps.copy_(gaps0); delta2.zero_()
+                anchor.copy_(anchor0); gaps.copy_(gaps0)
+                delta2.copy_(d0 if d0 is not None else torch.zeros_like(delta2))
                 if delta3 is not None:
                     delta3.zero_()
 
@@ -382,7 +483,8 @@ def train_flexnu(
     row_block: int = 64,
     lambda_s2: float = 0.0,
     damp_hessian: bool = True,
-    delta_init_noise: float = 0.0
+    use_init_labels: bool = False,
+    delta_init_noise: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """FlexNu solver for GuidedQuant Eq. (7).
 
@@ -441,7 +543,8 @@ def train_flexnu(
                 use_delta3=use_delta3, freeze_codebook=freeze_codebook,
                 freeze_scale=freeze_scale, stage_frac=stage_frac,
                 eval_every=eval_every, lambda_s2=lambda_s2,
-                delta_init_noise=delta_init_noise
+                use_init_labels=use_init_labels,
+                delta_init_noise=delta_init_noise,
             )
             C_out[r0:r1] = cb
             labels_out[r0:r1] = idx

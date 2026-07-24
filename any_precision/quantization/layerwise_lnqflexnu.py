@@ -126,6 +126,9 @@ def train_lnq_flexnu(
         t_lnq = 0.0
         logging.info("[lnq+flexnu] stage 1 SKIPPED (skip_lnq=True)")
     else:
+        # Imported here, not at module scope: layerwise_quantize imports
+        # THIS module, so a top-level import back into it is circular.
+        # By call time layerwise_quantize is fully initialised.
         from .layerwise_quantize import train_least_squares
 
         t0 = time.time()
@@ -170,9 +173,14 @@ def train_lnq_flexnu(
             r1 = min(r0 + rb, lo + group_size)
             cb, idx, _, _ = _optimize_rows(
                 Wt[r0:r1], H_g,
-                L_lnq[r0:r1],          # LNQ assignments (unused by _optimize_rows
-                                       # except for shape; it re-derives nearest)
-                C_lnq[r0:r1],          # <-- the key change: LNQ's codebook as init
+                L_lnq[r0:r1],          # LNQ's CD-optimised assignments
+                C_lnq[r0:r1],          # LNQ's closed-form-optimal codebook
+                # Honour BOTH. Without use_init_labels the solver re-derives
+                # nearest-codeword, discarding the ~20% non-nearest choices that
+                # coordinate descent bought -- which starts stage 2 strictly
+                # worse than LNQ's committed solution.
+                use_init_labels=True,
+                delta_init_noise=delta_init_noise,
                 iters=iters, lr_scale=lr_scale, lr_cb=lr_cb,
                 tau_frac=tau_frac, use_delta3=use_delta3,
                 freeze_codebook=freeze_codebook, freeze_scale=freeze_scale,
