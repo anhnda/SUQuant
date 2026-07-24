@@ -60,7 +60,7 @@ def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, retu
 
     # Check cache first
     cache_path = Path(cache_dir)
-    cache_path.mkdir(exist_ok=True)
+    cache_path.mkdir(parents=True, exist_ok=True)
 
     cache_file = cache_path / f"c4_calib_n{n_samples}_len{seqlen}_seed{seed}_tensors{return_tensors}.pkl"
     if cache_file.exists():
@@ -171,7 +171,7 @@ def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
 
     # Check cache first
     cache_path = Path(cache_dir)
-    cache_path.mkdir(exist_ok=True)
+    cache_path.mkdir(parents=True, exist_ok=True)
 
     cache_file = cache_path / f"wikitext2_calib_n{n_samples}_len{seqlen}_seed{seed}_split{split}.pkl"
     if cache_file.exists():
@@ -266,7 +266,7 @@ def get_redpajama_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
     print(f"  Seed: {seed}")
 
     cache_path = Path(cache_dir)
-    cache_path.mkdir(exist_ok=True)
+    cache_path.mkdir(parents=True, exist_ok=True)
 
     cache_file = cache_path / (
         f"redpajama_calib_n{n_samples}_len{seqlen}_seed{seed}_tensors{return_tensors}.pkl"
