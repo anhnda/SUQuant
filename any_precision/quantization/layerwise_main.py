@@ -183,6 +183,8 @@ def layerwise_nuq(
         num_iterations=num_iterations,
         cd_cycles=cd_cycles,
         sub_qlayer=sub_qlayer,
+        solver=solver,
+        flexnu_kwargs=flexnu_kwargs,
     )
 
     if mode == 'quantize':
