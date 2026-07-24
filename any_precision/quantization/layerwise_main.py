@@ -46,7 +46,7 @@ def layerwise_nuq(
     # ------------------- Set cache paths -------------------
 
     model_string = model if isinstance(model, str) else model.name_or_path
-    model_name = model_string.split("/")[-1]
+    model_name = model_name or model_string.split("/")[-1]
     initialization_cache_path = (f"{cache_dir}/quantized/"
                           f"{model_name}-w{seed_precision}_orig{seed_precision}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}")
