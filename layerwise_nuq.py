@@ -53,6 +53,9 @@ if __name__ == "__main__":
     parser.add_argument("--bopt_max_cd_sweeps", type=int, default=20)
     parser.add_argument("--bopt_chain_depth", type=int, default=18)
     parser.add_argument("--bopt_n_chains", type=int, default=200)
+    parser.add_argument("--bopt_b2_max_passes", type=int, default=8,
+                        help="Restricted-VND passes for B=2 (1 safe move/channel "
+                             "per pass; iterate to a 2-opt fixed point)")
     parser.add_argument("--bopt_verbose", type=str2bool, default=True,
                         help="Per-group/per-stage §2.6 instrumentation (funnel, "
                              "level-jumps, calib-vs-holdout)")

@@ -389,40 +389,38 @@ def _stage_pair_pass(
         lk = best_lin % m                                        # level for k
         best_gain = best_gain.masked_fill(~valid_p, float('inf'))
 
-        # Step G: greedy disjoint accept within each channel
-        used = torch.zeros(C, d, dtype=torch.bool, device=dev)
-        order = best_gain.argsort(dim=1)                        # (C,P) ascending
+        # Step G: accept ONLY the single best pair per channel this pass.
+        # -------------------------------------------------------------------
+        # Committing multiple disjoint pairs in the SAME channel is NOT safe
+        # when H is dense: two pairs with disjoint support (a) and (b) still
+        # interact through 2 * delta_a^T H delta_b, which does not vanish just
+        # because the supports are disjoint. Two individually-improving pairs
+        # can therefore make the union WORSE. The only exact-safe batch is:
+        # one move per channel, all channels in parallel (channels are
+        # independent objectives). For more moves, iterate the pass (caller's
+        # restricted-VND loop) with a fresh G each time.
         thr = -kappa2 * tau
         n_prop += int(torch.isfinite(best_gain).sum())
         n_below += int(((best_gain < thr) & torch.isfinite(best_gain)).sum())
-        for p in range(P):
-            sel = order[:, p]                                   # (C,)
-            g_sel = best_gain[cc[:, 0], sel]                    # (C,)
-            ii = i_idx[cc[:, 0], sel]
-            kk = k_idx[cc[:, 0], sel]
-            li_s = li[cc[:, 0], sel]
-            lk_s = lk[cc[:, 0], sel]
-            ok = (g_sel < thr) & torch.isfinite(g_sel) \
-                 & ~used[torch.arange(C, device=dev), ii] \
-                 & ~used[torch.arange(C, device=dev), kk] \
-                 & (ii != kk)
-            if not bool(ok.any()):
+        # best proposal per channel
+        gbest, pbest = best_gain.min(dim=1)                     # (C,), (C,)
+        take = (gbest < thr) & torch.isfinite(gbest)           # (C,)
+        rows_ok = take.nonzero(as_tuple=True)[0]
+        for rr in rows_ok.tolist():
+            gr = r0 + rr
+            p = int(pbest[rr])
+            ci, ck = int(i_idx[rr, p]), int(k_idx[rr, p])
+            if ci == ck:
                 continue
-            rows_ok = ok.nonzero(as_tuple=True)[0]
-            for rr in rows_ok.tolist():
-                gr = r0 + rr
-                ci, ck = int(ii[rr]), int(kk[rr])
-                old_i, old_k = int(idx[gr, ci]), int(idx[gr, ck])
-                new_i, new_k = int(li_s[rr]), int(lk_s[rr])
-                idx[gr, ci] = new_i
-                idx[gr, ck] = new_k
-                used[rr, ci] = True
-                used[rr, ck] = True
-                n_accept += 1
-                dE_released += -float(g_sel[rr])
-                frac_rows[gr] = True
-                jump_hist[abs(new_i - old_i)] += 1
-                jump_hist[abs(new_k - old_k)] += 1
+            old_i, old_k = int(idx[gr, ci]), int(idx[gr, ck])
+            new_i, new_k = int(li[rr, p]), int(lk[rr, p])
+            idx[gr, ci] = new_i
+            idx[gr, ck] = new_k
+            n_accept += 1
+            dE_released += -float(gbest[rr])
+            frac_rows[gr] = True
+            jump_hist[abs(new_i - old_i)] += 1
+            jump_hist[abs(new_k - old_k)] += 1
 
     stats = {
         "n_accept": n_accept,
@@ -486,9 +484,8 @@ def _stage_triple_pass(
         k_idx = nb_idx[i_idx, top_lin % nu]
         valid_p = torch.isfinite(top_val)
 
-        used = torch.zeros(C, d, dtype=torch.bool, device=dev)
-        # channel-serial acceptance keeps the third-coordinate growth simple and
-        # the disjointness bookkeeping exact.
+        # One cluster per channel per pass (see the dense-H interaction hazard
+        # documented in _stage_pair_pass Step G). Iterate the pass for more.
         for c in range(C):
             gr = r0 + c
             order = torch.argsort(-top_val[c])       # best synergy first
@@ -496,11 +493,11 @@ def _stage_triple_pass(
                 if not bool(valid_p[c, pi]):
                     break
                 i = int(i_idx[c, pi]); k = int(k_idx[c, pi])
-                if used[c, i] or used[c, k] or i == k:
+                if i == k:
                     continue
                 # grow: third coord l maximising aggregate synergy with {i,k}
                 cand_l = torch.cat([nb_idx[i], nb_idx[k]]).unique()
-                cand_l = cand_l[cand[c, cand_l] & ~used[c, cand_l]]
+                cand_l = cand_l[cand[c, cand_l]]
                 cand_l = cand_l[(cand_l != i) & (cand_l != k)]
                 T = [i, k]
                 if cand_l.numel() > 0:
@@ -531,14 +528,14 @@ def _stage_triple_pass(
                 g_best = float(dE[best])
                 if g_best >= thr:
                     continue
-                # commit
+                # commit this one cluster, then move to the next channel
                 for a_i, coord in enumerate(T):
                     idx[gr, coord] = int(lvl[a_i, best])
-                    used[c, coord] = True
                 n_accept += 1
                 dE_released += -g_best
                 frac_rows[gr] = True
                 size_hist[len(T)] = size_hist.get(len(T), 0) + 1
+                break   # at most one cluster per channel per pass
 
     stats = {
         "n_accept": n_accept,
@@ -688,6 +685,7 @@ def bopt_refine(
     fix_dead: bool = True,
     chain_depth: int = 18,
     n_chains: int = 200,
+    b2_max_passes: int = 8,   # restricted-VND passes for B=2 (1 move/chan/pass)
     gate_release_frac: float = 0.005,   # spec 2.7: 0.5%
     device: Optional[str] = None,
     verbose: bool = True,               # per-group / per-stage §2.6 instrumentation
@@ -821,11 +819,34 @@ def bopt_refine(
         kappa2 = _kappa(kappa1, log_n1, math.log(max(d * nu * m * m / 2, 2)))
         kappa3 = _kappa(kappa1, log_n1, math.log(max(d * nu * nu * m**3 / 6, 2)))
 
-        # --- Stage 1: B=2 --------------------------------------------------- #
+        # --- Stage 1: B=2 (restricted VND to fixed point) ------------------- #
+        # One safe move per channel per pass; iterate with a fresh exact G until
+        # no channel accepts (restricted 2-opt fixed point) or pass cap hit.
+        # Refreshing G from scratch each pass is what makes the per-pass gains
+        # exact -- every move is measured against the true current residual.
         f_pre = _group_energy(E, H_g).mean().item()
-        idx, s1 = _stage_pair_pass(
-            W_g, H_g, Hdiag, G, cb, idx, E, nb_idx, H_nb,
-            tau, kappa2, c_cand=c_cand, top_p=top_p)
+        s1 = {"n_accept": 0, "frac_channels": 0.0, "dE_released": 0.0,
+              "jump_hist": [0]*m,
+              "funnel": {"candidates": 0, "proposals": 0,
+                         "below_thresh": 0, "accepted": 0},
+              "passes": 0}
+        for _pass in range(b2_max_passes):
+            idx, sp = _stage_pair_pass(
+                W_g, H_g, Hdiag, G, cb, idx, E, nb_idx, H_nb,
+                tau, kappa2, c_cand=c_cand, top_p=top_p)
+            s1["n_accept"] += sp["n_accept"]
+            s1["dE_released"] += sp["dE_released"]
+            s1["passes"] += 1
+            for j in range(m):
+                s1["jump_hist"][j] += sp["jump_hist"][j]
+            for key in ("candidates", "proposals", "below_thresh", "accepted"):
+                s1["funnel"][key] += sp["funnel"][key]
+            s1["frac_channels"] = max(s1["frac_channels"], sp["frac_channels"])
+            if sp["n_accept"] == 0:
+                break
+            # refresh exact G before the next pass (moves changed the residual)
+            E = _gather_cb(cb, idx) - W_g
+            G = E @ H_g
         cb = solve_codebook(W_g, H_solve, idx, m)     # spec 2.1 trailing re-solve
         E = _gather_cb(cb, idx) - W_g
         G = E @ H_g

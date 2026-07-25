@@ -15,6 +15,7 @@ _spec = importlib.util.spec_from_file_location("layerwise_bopt", _p)
 _bopt = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_bopt)
 bopt_refine        = _bopt.bopt_refine
 _stage_pair_pass   = _bopt._stage_pair_pass
+_stage_triple_pass = _bopt._stage_triple_pass
 _alt_gains         = _bopt._alt_gains
 _neighbour_lists   = _bopt._neighbour_lists
 _gather_cb         = _bopt._gather_cb
@@ -134,5 +135,75 @@ assert log["obj_final"] <= log["obj_init"] + 1e-6, "calib objective rose"
 g0 = log["groups"][0]
 print(f" calib obj {log['obj_init']:.4f} -> {log['obj_final']:.4f} | holdout tracked={'mse_holdout_after_cd' in g0}")
 print(" OK\n")
+
+print("=== Test 7: batch safety on DENSE H (per-pass energy must not rise) ===")
+# Dense H with strong cross-block coupling: this is the regime where accepting
+# multiple disjoint pairs per channel could raise energy via the cross term
+# 2*delta_a^T H delta_b. bopt_refine must never let exact energy increase.
+torch.manual_seed(11)
+dd2 = 96
+Ad = torch.randn(dd2, dd2) * 0.5           # dense, strong off-diagonal
+Hd2 = Ad @ Ad.T + torch.eye(dd2) * 0.05; Hd2 = 0.5 * (Hd2 + Hd2.T)
+assert torch.linalg.eigvalsh(Hd2).min() > 0, "H not PD"
+Rr, mm = 48, 4
+Wd = torch.randn(Rr, dd2).numpy(); Wdt = torch.tensor(Wd)
+cbd = torch.stack([torch.quantile(Wdt[r], torch.linspace(0, 1, mm)) for r in range(Rr)])
+idxd = (Wdt.unsqueeze(-1) - cbd.unsqueeze(1)).abs().argmin(-1)
+ld = idxd.numpy().astype(np.uint8); Cd = cbd.numpy().astype(np.float32)
+
+def exact_energy(labels, C, Hten):
+    idx = torch.tensor(labels, dtype=torch.long); cb = torch.tensor(C)
+    Wh = torch.gather(cb.unsqueeze(1).expand(-1, Hten.shape[0], -1), 2,
+                      idx.unsqueeze(-1)).squeeze(-1)
+    e = Wh - Wdt
+    return torch.einsum('ri,ij,rj->', e, Hten, e).item()
+
+e_in = exact_energy(ld, Cd, Hd2)
+for kap in (2.0, 1.0, 0.3):   # including aggressive kappa that accepts a lot
+    lab, Cn, log = bopt_refine(Wd, Hd2.numpy()[None], ld, Cd, stages=2,
+                               device="cpu", kappa1=kap, verbose=False,
+                               b2_max_passes=8)
+    e_out = exact_energy(lab, Cn, Hd2)
+    assert e_out <= e_in + 1e-4, \
+        f"DENSE-H MONOTONICITY VIOLATED at kappa1={kap}: {e_in:.4f} -> {e_out:.4f}"
+print(f" dense H ({dd2}x{dd2}), kappa in {{2,1,0.3}}: energy never rose (in={e_in:.2f})")
+print(" OK: one-move-per-channel batch is exact-safe under dense H\n")
+
+print("=== Test 8: B=3 POSITIVE CONTROL -- 2-opt but not 3-opt ===")
+# From the review doc: equicorrelation H, a point that is exactly 2-opt (no
+# single OR pair move helps) but whose TRIPLE flip strictly improves. B=2 must
+# fail to move it; B=3 must solve it.
+d3 = 3
+H3 = torch.tensor([[1., -0.4, -0.4], [-0.4, 1., -0.4], [-0.4, -0.4, 1.]])
+assert torch.linalg.eigvalsh(H3).min() > 0, "H3 not PD"
+w3 = torch.tensor([[0.75, 0.75, 0.75]])
+cb3 = torch.tensor([[0., 1.]])
+idx3 = torch.zeros(1, d3, dtype=torch.long)
+Hd3 = torch.diagonal(H3).clone()
+def E3(ix):
+    e = _gather_cb(cb3, ix) - w3; return (e @ H3 * e).sum().item()
+base3 = E3(idx3); triple3 = E3(torch.ones(1, d3, dtype=torch.long))
+assert triple3 < base3 - 0.1, "setup wrong: triple does not help"
+
+Wq3 = _gather_cb(cb3, idx3); E3t = Wq3 - w3; G3 = E3t @ H3
+a3, _, _ = _alt_gains(w3, E3t, G3, Hd3, cb3, idx3)
+nb3, Hnb3 = _neighbour_lists(H3, Hd3, nu=2)
+tau3 = a3.abs().median().clamp_min(1e-30).item()
+
+# B=2 must NOT solve it (it is 2-opt): pair pass leaves it unmoved
+idx_p, sp = _stage_pair_pass(w3, H3, Hd3, G3, cb3, idx3.clone(), E3t,
+                             nb3, Hnb3, tau3, kappa2=0.3, c_cand=64.0, top_p=50)
+assert sp["n_accept"] == 0, "B=2 wrongly moved a 2-opt point"
+
+# B=3 MUST solve it
+idx_t, st3 = _stage_triple_pass(w3, H3, Hd3, G3, cb3, idx3.clone(), E3t,
+                                nb3, Hnb3, tau3, kappa3=0.3, c_cand=64.0, top_p=50)
+assert st3["n_accept"] >= 1, f"B=3 failed to cross the triple barrier (stats={st3})"
+assert (idx_t[0] == 1).all(), f"B=3 moved to wrong state: {idx_t[0].tolist()}"
+e_after3 = E3(idx_t)
+assert e_after3 < base3 - 0.1, "B=3 accepted but energy did not drop"
+print(f" 2-opt point {base3:.3f}: B=2 leaves it (accept=0), "
+      f"B=3 solves it {base3:.3f}->{e_after3:.3f}")
+print(" OK: B=3 reaches what B=2 structurally cannot\n")
 
 print("ALL TESTS PASSED")
