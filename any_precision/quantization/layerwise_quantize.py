@@ -383,12 +383,11 @@ def seed_layer(
                 **_fk,
             )
         else:
-            labels, C = train_least_squares(
+            labels, C, log_dict = train_least_squares(
                 reshaped_module_weight, init_labels, init_centroids,
                 module_hessian,
                 num_iterations=num_iterations, cd_cycles=cd_cycles,
             )
-            log_dict = {}
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
         labels = labels.reshape(output_dim, 1, input_dim) # Shape: (output_dim, 1, input_dim)
         C = C.reshape(output_dim, 1, n_cluster) # Shape: (output_dim, 1, n_cluster)
