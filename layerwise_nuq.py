@@ -53,6 +53,9 @@ if __name__ == "__main__":
     parser.add_argument("--bopt_max_cd_sweeps", type=int, default=20)
     parser.add_argument("--bopt_chain_depth", type=int, default=18)
     parser.add_argument("--bopt_n_chains", type=int, default=200)
+    parser.add_argument("--bopt_verbose", type=str2bool, default=True,
+                        help="Per-group/per-stage §2.6 instrumentation (funnel, "
+                             "level-jumps, calib-vs-holdout)")
     parser.add_argument("--flexnu_iters", type=int, default=300)
     parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
     parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)

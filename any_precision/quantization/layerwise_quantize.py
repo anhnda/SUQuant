@@ -361,6 +361,7 @@ def seed_layer(
                 max_cd_sweeps=int(bk.pop("bopt_max_cd_sweeps", 20)),
                 chain_depth=int(bk.pop("bopt_chain_depth", 18)),
                 n_chains=int(bk.pop("bopt_n_chains", 200)),
+                verbose=bool(bk.pop("bopt_verbose", True)),
             )
             log_dict = {"lnq_log": lnq_log, "bopt_log": bopt_log}
         elif solver == "lnqflexnu":

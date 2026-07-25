@@ -81,6 +81,62 @@ def _kappa(kappa1: float, log_n1: float, log_nB: float) -> float:
     return kappa1 * math.sqrt(max(log_nB, 1e-9) / max(log_n1, 1e-9))
 
 
+def _log_stage(k: int, name: str, s: dict, f_before: float, f_after: float,
+               d: int, kappa: float,
+               mse_hold_before: Optional[float] = None,
+               mse_hold_after: Optional[float] = None) -> None:
+    """Emit the §2.6 instrumentation for one stage of one group.
+
+    Item 5 (calib-vs-holdout) is the one that matters: calibration energy MUST
+    drop (monotonicity). If held-out energy does not follow, the stage is
+    harvesting estimation noise and kappa should be raised, not celebrated.
+    """
+    rel = (f_before - f_after) / max(f_before, 1e-12)
+    msg = (
+        f"[bopt][g{k}] {name}: "
+        f"accept={s['n_accept']} "                          # item 1
+        f"chans={100*s['frac_channels']:.1f}% "             # item 2
+        f"dE_released={s['dE_released']:.4e} ({100*rel:.3f}% of f) "  # item 3
+        f"kappa={kappa:.2f}"
+    )
+    if "jump_hist" in s:                                    # item 4
+        jh = s["jump_hist"]
+        multi = sum(jh[2:]) if len(jh) > 2 else 0
+        tot = max(sum(jh), 1)
+        msg += (f" | level-jumps={jh} "
+                f"(multi-level={100*multi/tot:.1f}% <- LNQ-only, TFIC cannot)")
+    if "cluster_size_hist" in s:                            # item 4 (B=3)
+        msg += f" | cluster_sizes={s['cluster_size_hist']}"
+    if "depth_hist" in s:                                   # item 4 (chains)
+        dh = s["depth_hist"]
+        deep = sum(i * c for i, c in enumerate(dh))
+        msg += f" | chain_depths(hist)={dh}"
+    if "funnel" in s:                                       # why accept is what it is
+        fn = s["funnel"]
+        msg += (f" | funnel: cand={fn['candidates']} "
+                f"-> prop={fn['proposals']} -> below_thr={fn['below_thresh']} "
+                f"-> accept={fn['accepted']}")
+        if s["n_accept"] == 0:
+            if fn["candidates"] == 0:
+                msg += "  [no coords near a barrier -- c_cand too tight or truly 1-opt-deep]"
+            elif fn["proposals"] == 0:
+                msg += "  [candidates found but no synergistic pairs -- couplings weak]"
+            elif fn["below_thresh"] == 0:
+                msg += "  [pairs exist but none beat kappa*tau -- lower kappa1 to probe]"
+    logging.info(msg)
+    # item 5: calibration vs holdout — the noise-harvesting check
+    if mse_hold_before is not None and mse_hold_after is not None:
+        rel_h = (mse_hold_before - mse_hold_after) / max(mse_hold_before, 1e-12)
+        follow = rel_h / rel if rel > 1e-12 else float("nan")
+        flag = ""
+        if rel > 1e-9 and rel_h < 0.5 * rel:
+            flag = "  <-- HOLDOUT LAGS: likely noise, RAISE kappa"
+        logging.info(
+            f"[bopt][g{k}] {name} item5: calib -{100*rel:.3f}%  "
+            f"holdout -{100*rel_h:.3f}%  (holdout/calib={follow:.2f}){flag}"
+        )
+
+
 # =========================================================================== #
 # Prerequisites (spec 1)  -- confound controls, all cheap
 # =========================================================================== #
@@ -246,6 +302,9 @@ def _stage_pair_pass(
     dE_released = 0.0
     jump_hist = torch.zeros(m, dtype=torch.long)   # level-jump distances
     frac_rows = torch.zeros(R, dtype=torch.bool)
+    n_cand = 0            # coords passing the candidate mask
+    n_prop = 0           # finite pair proposals enumerated
+    n_below = 0          # proposals whose EXACT best gain beats -kappa*tau
 
     ar = torch.arange(d, device=dev)
     for r0 in range(0, R, row_chunk):
@@ -258,6 +317,7 @@ def _stage_pair_pass(
 
         # candidate mask: pressed against a barrier (Step C)
         cand = a_c <= c_cand * tau         # (C,d)  a>=0 at fp; small a => tight
+        n_cand += int(cand.sum())
 
         # pair synergy S[c, i, n] = -2 dstar[c,i] dstar[c,nb[i,n]] H_nb[i,n]  (Step E)
         # nb neighbour delta for each channel: (C, d, nu)
@@ -308,6 +368,8 @@ def _stage_pair_pass(
         used = torch.zeros(C, d, dtype=torch.bool, device=dev)
         order = best_gain.argsort(dim=1)                        # (C,P) ascending
         thr = -kappa2 * tau
+        n_prop += int(torch.isfinite(best_gain).sum())
+        n_below += int(((best_gain < thr) & torch.isfinite(best_gain)).sum())
         for p in range(P):
             sel = order[:, p]                                   # (C,)
             g_sel = best_gain[cc[:, 0], sel]                    # (C,)
@@ -342,6 +404,8 @@ def _stage_pair_pass(
         "frac_channels": frac_rows.float().mean().item(),
         "dE_released": dE_released,
         "jump_hist": jump_hist.tolist(),
+        "funnel": {"candidates": n_cand, "proposals": n_prop,
+                   "below_thresh": n_below, "accepted": n_accept},
     }
     return idx, stats
 
@@ -601,6 +665,8 @@ def bopt_refine(
     n_chains: int = 200,
     gate_release_frac: float = 0.005,   # spec 2.7: 0.5%
     device: Optional[str] = None,
+    verbose: bool = True,               # per-group / per-stage §2.6 instrumentation
+    H_holdout: Optional[np.ndarray] = None,  # fresh calib split for §2.6 item 5
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Refine LNQ's (labels, C) with staged B-opt. Returns (labels, C, log).
 
@@ -628,7 +694,17 @@ def bopt_refine(
 
     obj0 = _obj_lnq(Wt, Ht, idx_all, cb_all, g, gs)
 
+    Ht_hold = _as_t(H_holdout, torch.float32, dev) if H_holdout is not None else None
+
     log = {"obj_init": obj0, "groups": [], "stages_run": stages}
+    agg_jumps = torch.zeros(m, dtype=torch.long)   # rolled-up level-jump histogram
+
+    if verbose:
+        logging.info(
+            f"[bopt] START  obj={obj0:.6f}  layer={out_dim}x{d}  m={m}  g={g}  "
+            f"stages={stages}  nu={nu}  top_p={top_p}  kappa1={kappa1}"
+            + ("  (+holdout H)" if Ht_hold is not None else "")
+        )
 
     for k in range(g):
         lo, hi = k * gs, (k + 1) * gs
@@ -647,6 +723,14 @@ def bopt_refine(
         if fix_dead and dead_rate > 0:
             cb = reseed_dead_codewords(W_g, H_g, Hdiag, cb, idx, dead)
             cb = solve_codebook(W_g, H_solve, idx, m)
+        _, dead_rate_after = empty_codeword_audit(idx, m)
+        glog["dead_rate_after"] = dead_rate_after
+        if verbose and dead_rate > 0:
+            logging.info(
+                f"[bopt][g{k}] §1.2 dead codewords: {100*dead_rate:.2f}% -> "
+                f"{100*dead_rate_after:.2f}%"
+                + ("  <-- 2-bit capacity loss, reseeded" if m <= 4 else "")
+            )
 
         # 1.1 CD to an actual 1-opt fixed point
         idx, n_flips, sweeps = cd_to_fixed_point(
@@ -654,14 +738,33 @@ def bopt_refine(
         glog["cd_sweeps_to_fp"] = sweeps
         glog["cd_flips_last"] = n_flips
         cb = solve_codebook(W_g, H_solve, idx, m)
+        if verbose:
+            trunc = "  <-- LNQ's K=4 would have TRUNCATED here" if sweeps > 4 else ""
+            logging.info(
+                f"[bopt][g{k}] §1.1 CD->fixed point in {sweeps} sweeps "
+                f"(last-sweep flips={n_flips}){trunc}"
+            )
 
         # residual + G at the 1-opt point
         E = _gather_cb(cb, idx) - W_g
         G = E @ H_g                                  # (R,d): G[r] = H_g @ E[r]
         f_after_cd = _group_energy(E, H_g).mean().item()
         glog["f_after_cd"] = f_after_cd
+        # §2.6 item 5: held-out energy baseline on a FRESH Hessian
+        if Ht_hold is not None:
+            mse_hold_before = _group_energy(E, Ht_hold[k]).mean().item()
+            glog["mse_holdout_after_cd"] = mse_hold_before
 
         nb_idx, H_nb = _neighbour_lists(H_g, Hdiag, nu)
+        # §2.6 item 6: sign histogram of H[i,k] over the neighbour lists
+        if verbose:
+            pos = int((H_nb > 0).sum()); neg = int((H_nb < 0).sum())
+            tot = max(pos + neg, 1)
+            glog["nb_sign_pos_frac"] = pos / tot
+            logging.info(
+                f"[bopt][g{k}] §2.6.6 neighbour H[i,k] sign: "
+                f"+{100*pos/tot:.1f}% / -{100*neg/tot:.1f}%  (nu={nu})"
+            )
 
         # noise floor (spec 2.3 Step B / 2.4)
         cand_pool = (torch.arange(d, device=dev),)   # use all coords for tau
@@ -675,6 +778,7 @@ def bopt_refine(
         kappa3 = _kappa(kappa1, log_n1, math.log(max(d * nu * nu * m**3 / 6, 2)))
 
         # --- Stage 1: B=2 --------------------------------------------------- #
+        f_pre = _group_energy(E, H_g).mean().item()
         idx, s1 = _stage_pair_pass(
             W_g, H_g, Hdiag, G, cb, idx, E, nb_idx, H_nb,
             tau, kappa2, c_cand=c_cand, top_p=top_p)
@@ -682,21 +786,50 @@ def bopt_refine(
         E = _gather_cb(cb, idx) - W_g
         G = E @ H_g
         glog["stage1"] = s1
+        f_post = _group_energy(E, H_g).mean().item()
+        agg_jumps += torch.tensor(s1.get("jump_hist", [0]*m)[:m])
+        if verbose:
+            mhb = mha = None
+            if Ht_hold is not None:
+                mha = _group_energy(E, Ht_hold[k]).mean().item()
+                mhb = glog.get("mse_holdout_after_cd")
+            _log_stage(k, "S1(B=2)", s1, f_pre, f_post, d, kappa2, mhb, mha)
 
         # --- Stage 2: B=3 --------------------------------------------------- #
         if stages >= 2:
+            f_pre = _group_energy(E, H_g).mean().item()
             idx, s2 = _stage_triple_pass(
                 W_g, H_g, Hdiag, G, cb, idx, E, nb_idx, H_nb,
                 tau, kappa3, c_cand=c_cand, top_p=top_p)
+            # energy attributable to the TRIPLE MOVES themselves (before re-sweep)
+            E_tp = _gather_cb(cb, idx) - W_g
+            f_triples = _group_energy(E_tp, H_g).mean().item()
             # spec 3.2: one CD re-sweep, then codebook solve
-            idx, _, _ = cd_to_fixed_point(W_g, H_g, Hdiag, cb, idx, max_sweeps=1)
+            idx, resweep_flips, _ = cd_to_fixed_point(
+                W_g, H_g, Hdiag, cb, idx, max_sweeps=1)
             cb = solve_codebook(W_g, H_solve, idx, m)
             E = _gather_cb(cb, idx) - W_g
             G = E @ H_g
+            s2["resweep_flips"] = resweep_flips
             glog["stage2"] = s2
+            f_post = _group_energy(E, H_g).mean().item()
+            if verbose:
+                # attribute honestly: triple moves vs the trailing CD re-sweep
+                rel_tp = (f_pre - f_triples) / max(f_pre, 1e-12)
+                rel_rs = (f_triples - f_post) / max(f_pre, 1e-12)
+                logging.info(
+                    f"[bopt][g{k}] S2 attribution: triple-moves {100*rel_tp:.3f}% "
+                    f"+ CD-resweep {100*rel_rs:.3f}% (flips={resweep_flips})"
+                )
+                mhb = mha = None
+                if Ht_hold is not None:
+                    mha = _group_energy(E, Ht_hold[k]).mean().item()
+                    mhb = glog.get("mse_holdout_after_cd")
+                _log_stage(k, "S2(B=3)", s2, f_pre, f_post, d, kappa3, mhb, mha)
 
         # --- Stage 3: ejection chains -------------------------------------- #
         if stages >= 3:
+            f_pre = _group_energy(E, H_g).mean().item()
             idx, s3 = _stage_chain_pass(
                 W_g, H_g, Hdiag, G, cb, idx, E, nb_idx,
                 tau, kappa2, depth=chain_depth, n_chains=n_chains)
@@ -704,10 +837,25 @@ def bopt_refine(
             E = _gather_cb(cb, idx) - W_g
             G = E @ H_g
             glog["stage3"] = s3
+            f_post = _group_energy(E, H_g).mean().item()
+            if verbose:
+                mhb = mha = None
+                if Ht_hold is not None:
+                    mha = _group_energy(E, Ht_hold[k]).mean().item()
+                    mhb = glog.get("mse_holdout_after_cd")
+                _log_stage(k, "S3(chain)", s3, f_pre, f_post, d, kappa2, mhb, mha)
 
         f_final = _group_energy(E, H_g).mean().item()
         glog["f_final"] = f_final
         glog["dE_released_frac"] = (f_after_cd - f_final) / max(f_after_cd, 1e-12)
+        # Gate on B-opt's OWN committed gain only (spec 2.7): sum of dE_released
+        # reported by the stages, which counts only exact-accepted moves and
+        # excludes the CD re-sweep cleanup that would otherwise inflate the gate.
+        bopt_released = sum(
+            glog.get(sk, {}).get("dE_released", 0.0)
+            for sk in ("stage1", "stage2", "stage3")
+        )
+        glog["bopt_release_frac"] = bopt_released / max(f_after_cd, 1e-12)
 
         idx_all[lo:hi] = idx
         cb_all[lo:hi] = cb
@@ -716,17 +864,43 @@ def bopt_refine(
     obj1 = _obj_lnq(Wt, Ht, idx_all, cb_all, g, gs)
     log["obj_final"] = obj1
     log["obj_rel"] = (obj1 - obj0) / max(obj0, 1e-12)
-    # spec 2.7 gate signal (median over groups)
-    rels = [gg["dE_released_frac"] for gg in log["groups"]]
+    # spec 2.7 gate signal (median over groups) — on B-opt's committed gain,
+    # NOT total energy drop (which includes CD-resweep cleanup, a confound).
+    rels = [gg["bopt_release_frac"] for gg in log["groups"]]
+    rels_total = [gg["dE_released_frac"] for gg in log["groups"]]
     log["median_release_frac"] = float(np.median(rels)) if rels else 0.0
+    log["median_total_drop_frac"] = float(np.median(rels_total)) if rels_total else 0.0
     log["gate_pass_release"] = log["median_release_frac"] >= gate_release_frac
+    log["agg_jump_hist"] = agg_jumps.tolist()
     log["time_s"] = time.time() - t0
 
+    # totals rolled up across groups/stages for a one-glance summary
+    def _tot(stage_key):
+        return sum(gg.get(stage_key, {}).get("n_accept", 0) for gg in log["groups"])
+    tot1, tot2, tot3 = _tot("stage1"), _tot("stage2"), _tot("stage3")
+    log["total_accepts"] = {"S1": tot1, "S2": tot2, "S3": tot3}
+    jh = agg_jumps.tolist()
+    multi = sum(jh[2:]) if len(jh) > 2 else 0
+    tot_j = max(sum(jh), 1)
+
+    if verbose:
+        logging.info(
+            f"[bopt] SUMMARY accepts: S1(B=2)={tot1}"
+            + (f" S2(B=3)={tot2}" if stages >= 2 else "")
+            + (f" S3(chain)={tot3}" if stages >= 3 else "")
+            + f" | agg level-jumps={jh} (multi-level {100*multi/tot_j:.1f}%)"
+        )
+    reason = ("barriers present at reachable points"
+              if log["gate_pass_release"]
+              else "barriers SPARSE at points the pipeline reaches "
+                   "(clean negative vs TFIC's central claim -- STOP, write it up)")
     logging.info(
         f"[bopt] obj {obj0:.6f} -> {obj1:.6f} ({100*log['obj_rel']:+.3f}%) | "
-        f"median release {100*log['median_release_frac']:.3f}% "
-        f"(gate {'PASS' if log['gate_pass_release'] else 'fail'} @ "
-        f"{100*gate_release_frac:.1f}%) | {log['time_s']:.1f}s"
+        f"B-opt release {100*log['median_release_frac']:.3f}% "
+        f"(gate {'PASS' if log['gate_pass_release'] else 'FAIL'} @ "
+        f"{100*gate_release_frac:.1f}%: {reason}) | "
+        f"total energy drop {100*log['median_total_drop_frac']:.3f}% "
+        f"(incl. CD-resweep) | {log['time_s']:.1f}s"
     )
 
     labels_out = idx_all.detach().cpu().numpy().astype(np.uint8)
