@@ -1,81 +1,138 @@
+"""
+B-opt test suite.
+
+The critical test is Test 4 (positive control): a hand-built frustrated pair
+that IS a 1-opt fixed point but whose joint two-coordinate move strictly lowers
+energy. A correct B-opt MUST find and accept it. Without this test the suite is
+vacuous -- monotonicity alone passes even if the accept path is never taken
+(every stage can return accept=0 and the objective still drops from CD alone).
+"""
 import numpy as np, torch, logging, importlib.util, os
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 _p = os.path.join(os.path.dirname(__file__),
                   "any_precision/quantization/layerwise_bopt.py")
 _spec = importlib.util.spec_from_file_location("layerwise_bopt", _p)
 _bopt = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_bopt)
-bopt_refine = _bopt.bopt_refine
-_stage_pair_pass = _bopt._stage_pair_pass
-_alt_gains = _bopt._alt_gains
-_neighbour_lists = _bopt._neighbour_lists
-_gather_cb = _bopt._gather_cb
-_group_energy = _bopt._group_energy
-solve_codebook = _bopt.solve_codebook
-cd_to_fixed_point = _bopt.cd_to_fixed_point
+bopt_refine        = _bopt.bopt_refine
+_stage_pair_pass   = _bopt._stage_pair_pass
+_alt_gains         = _bopt._alt_gains
+_neighbour_lists   = _bopt._neighbour_lists
+_gather_cb         = _bopt._gather_cb
+_group_energy      = _bopt._group_energy
+solve_codebook     = _bopt.solve_codebook
+cd_to_fixed_point  = _bopt.cd_to_fixed_point
 
 torch.manual_seed(0); np.random.seed(0)
-dev = torch.device("cpu")
 
-# --- synthetic layer: correlated H so pair moves have something to exploit ---
 d, R, m, g = 64, 32, 4, 1
 X = torch.randn(256, d)
-# inject strong off-diagonal correlations
 A = torch.randn(d, d) * 0.3
-H = (X.T @ X) / 256 + A @ A.T          # PSD, correlated
+H = (X.T @ X) / 256 + A @ A.T + torch.eye(d) * 0.05
 H = 0.5 * (H + H.T)
-H = H + torch.eye(d) * 0.05
-Hg = H.numpy()[None]                    # (1,d,d)
-
-W = torch.randn(R, d).numpy()
-
-# k-means-ish init per row: cheap uniform codebook + nearest
-Wt = torch.tensor(W)
-cb0 = torch.stack([torch.quantile(Wt[r], torch.linspace(0,1,m)) for r in range(R)])
+Hg = H.numpy()[None]
+W = torch.randn(R, d).numpy(); Wt = torch.tensor(W)
+cb0 = torch.stack([torch.quantile(Wt[r], torch.linspace(0, 1, m)) for r in range(R)])
 idx0 = (Wt.unsqueeze(-1) - cb0.unsqueeze(1)).abs().argmin(-1)
-labels = idx0.numpy().astype(np.uint8)
-C = cb0.numpy().astype(np.float32)
+labels = idx0.numpy().astype(np.uint8); C = cb0.numpy().astype(np.float32)
 
 def obj(labels, C):
-    idx = torch.tensor(labels, dtype=torch.long)
-    cb = torch.tensor(C)
-    Wh = torch.gather(cb.unsqueeze(1).expand(-1,d,-1),2,idx.unsqueeze(-1)).squeeze(-1)
-    dW = (Wh - Wt).reshape(g, R//g, d)
+    idx = torch.tensor(labels, dtype=torch.long); cb = torch.tensor(C)
+    Wh = torch.gather(cb.unsqueeze(1).expand(-1, d, -1), 2, idx.unsqueeze(-1)).squeeze(-1)
+    dW = (Wh - Wt).reshape(g, R // g, d)
     return torch.einsum('nij,njk,nik->i', dW, torch.tensor(Hg), dW).mean().item()
+
 
 print("=== Test 1: monotonicity (objective must not increase) ===")
 o0 = obj(labels, C)
 for st in (1, 2, 3):
     lab, Cn, log = bopt_refine(W, Hg, labels, C, stages=st, device="cpu",
-                               n_chains=20, chain_depth=10)
+                               n_chains=20, chain_depth=10, verbose=False)
     o1 = obj(lab, Cn)
-    print(f" stage={st}: obj {o0:.6f} -> {o1:.6f}  ({100*(o1-o0)/o0:+.3f}%)  "
-          f"release={100*log['median_release_frac']:.3f}%")
     assert o1 <= o0 + 1e-6, f"MONOTONICITY VIOLATED at stage {st}"
 print(" OK: monotone at all stages\n")
 
-print("=== Test 2: exact pair gain matches brute-force energy delta ===")
-# take one row, one accepted-style pair, verify dE formula == actual energy diff
+
+print("=== Test 2: exact pair gain == brute-force energy delta ===")
 Wg = Wt.clone(); Hgt = torch.tensor(Hg[0]); Hdiag = torch.diagonal(Hgt).clone()
 cb = torch.tensor(C); idx = torch.tensor(labels, dtype=torch.long)
 idx = cd_to_fixed_point(Wg, Hgt, Hdiag, cb, idx, max_sweeps=20)[0]
-E = _gather_cb(cb, idx) - Wg
-G = E @ Hgt
+E = _gather_cb(cb, idx) - Wg; G = E @ Hgt
 r, i, k = 0, 3, 7
-new_i, new_k = (idx[r,i].item()+1)%m, (idx[r,k].item()+1)%m
-di = cb[r,new_i]-(_gather_cb(cb,idx)[r,i]); dk = cb[r,new_k]-(_gather_cb(cb,idx)[r,k])
-dE_formula = (2*di*G[r,i]+di**2*Hdiag[i] + 2*dk*G[r,k]+dk**2*Hdiag[k]
-              + 2*di*dk*Hgt[i,k]).item()
+new_i, new_k = (idx[r, i].item() + 1) % m, (idx[r, k].item() + 1) % m
+Wq = _gather_cb(cb, idx)
+di = cb[r, new_i] - Wq[r, i]; dk = cb[r, new_k] - Wq[r, k]
+dE_formula = (2*di*G[r, i] + di**2*Hdiag[i] + 2*dk*G[r, k] + dk**2*Hdiag[k]
+              + 2*di*dk*Hgt[i, k]).item()
 e_before = _group_energy(E[r:r+1], Hgt).item()
-idx2 = idx.clone(); idx2[r,i]=new_i; idx2[r,k]=new_k
-E2 = _gather_cb(cb, idx2) - Wg
-e_after = _group_energy(E2[r:r+1], Hgt).item()
-print(f" formula dE={dE_formula:.6e}   actual={e_after-e_before:.6e}")
-assert abs(dE_formula-(e_after-e_before)) < 1e-4, "PAIR GAIN FORMULA WRONG"
+idx2 = idx.clone(); idx2[r, i] = new_i; idx2[r, k] = new_k
+e_after = _group_energy((_gather_cb(cb, idx2) - Wg)[r:r+1], Hgt).item()
+assert abs(dE_formula - (e_after - e_before)) < 1e-4, "PAIR GAIN FORMULA WRONG"
+print(f" formula dE={dE_formula:.6e}  actual={e_after-e_before:.6e}")
 print(" OK: exact pair-gain formula verified\n")
 
-print("=== Test 3: held-out consistency (calib energy strictly down after B2) ===")
-lab, Cn, log = bopt_refine(W, Hg, labels, C, stages=1, device="cpu")
-print(f" accepts stage1 (group0): {log['groups'][0]['stage1']['n_accept']}")
-print(f" level-jump hist: {log['groups'][0]['stage1']['jump_hist']}")
+
+print("=== Test 3: CD reaches a real 1-opt fixed point ===")
+Wg = Wt.clone(); cb = torch.tensor(C); idx = torch.tensor(labels, dtype=torch.long)
+idx, nflip, sweeps, trend = cd_to_fixed_point(Wg, Hgt, Hdiag, cb, idx, max_sweeps=50)
+assert nflip == 0, f"CD did not converge: {nflip} flips after {sweeps} sweeps"
+E = _gather_cb(cb, idx) - Wg; G = E @ Hgt
+a, _, _ = _alt_gains(Wg, E, G, Hdiag, cb, idx)
+assert (a >= -1e-5).all(), "post-CD point is NOT 1-opt (negative single-flip gain)"
+print(f" converged in {sweeps} sweeps, all single-flip gains >= 0 (1-opt)\n")
+
+
+print("=== Test 4: POSITIVE CONTROL -- B-opt MUST cross a frustrated barrier ===")
+dd = 8
+Hf = torch.eye(dd); Hf[0, 1] = Hf[1, 0] = -0.5
+Wf = torch.zeros(1, dd); Wf[0, 0] = 0.95; Wf[0, 1] = 0.95
+cbf = torch.tensor([[0., 1.]])
+idxf = torch.zeros(1, dd, dtype=torch.long)
+Hdf = torch.diagonal(Hf).clone()
+Wq = _gather_cb(cbf, idxf); Ef = Wq - Wf; Gf = Ef @ Hf
+af, _, _ = _alt_gains(Wf, Ef, Gf, Hdf, cbf, idxf)
+assert (af[0, :2] > 0).all(), "setup wrong: single flip already helps, not a barrier"
+def E2(a, b_):
+    ix = idxf.clone(); ix[0, 0] = a; ix[0, 1] = b_
+    e = _gather_cb(cbf, ix) - Wf; return (e @ Hf * e).sum().item()
+base = E2(0, 0); joint = E2(1, 1)
+assert joint < base - 0.1, "setup wrong: joint move does not help"
+tau = af.abs().median().clamp_min(1e-30).item()
+nb_idx, H_nb = _neighbour_lists(Hf, Hdf, nu=dd-1)
+idx_out, st = _stage_pair_pass(Wf, Hf, Hdf, Gf, cbf, idxf.clone(), Ef,
+                               nb_idx, H_nb, tau, kappa2=0.5, c_cand=64.0, top_p=50)
+assert st["n_accept"] >= 1, \
+    f"POSITIVE CONTROL FAILED: B-opt did not accept a real barrier move (funnel={st['funnel']})"
+assert idx_out[0, 0].item() == 1 and idx_out[0, 1].item() == 1, \
+    f"accepted but wrong levels: {idx_out[0, :2].tolist()} != [1,1]"
+e_after = ((_gather_cb(cbf, idx_out) - Wf) @ Hf * (_gather_cb(cbf, idx_out) - Wf)).sum().item()
+assert e_after < base - 0.1, "energy did not drop after the accepted pair move"
+print(f" barrier crossed: energy {base:.4f} -> {e_after:.4f}, accepts={st['n_accept']}, levels->[1,1]")
+print(" OK: B-opt provably crosses a frustrated barrier (accept path exercised)\n")
+
+
+print("=== Test 5: noise floor rejects a sub-threshold move ===")
+idx_hi, st_hi = _stage_pair_pass(Wf, Hf, Hdf, Gf, cbf, idxf.clone(), Ef,
+                                 nb_idx, H_nb, tau, kappa2=2.0, c_cand=64.0, top_p=50)
+assert st_hi["n_accept"] == 0, "noise floor failed: accepted a move below kappa*tau"
+print(f" kappa2=2.0 (thr={2.0*tau:.2f}) correctly REJECTS the {base-joint:.2f} gain")
+print(" OK: noise floor gates as designed\n")
+
+
+print("=== Test 6: held-out consistency (real fresh Hessian) ===")
+torch.manual_seed(5)
+Ac = torch.randn(d, d) * 0.4
+Hc = Ac @ Ac.T + torch.eye(d) * 0.05; Hc = 0.5 * (Hc + Hc.T)
+Xh = torch.randn(256, d)
+Hh = (Xh.T @ Xh) / 256 + Ac @ Ac.T + torch.eye(d) * 0.05; Hh = 0.5 * (Hh + Hh.T)
+Wc = torch.randn(R, d).numpy(); Wct = torch.tensor(Wc)
+cbc = torch.stack([torch.quantile(Wct[r], torch.linspace(0, 1, m)) for r in range(R)])
+idxc = (Wct.unsqueeze(-1) - cbc.unsqueeze(1)).abs().argmin(-1)
+lc = idxc.numpy().astype(np.uint8); Cc = cbc.numpy().astype(np.float32)
+lab, Cn, log = bopt_refine(Wc, Hc.numpy()[None], lc, Cc, stages=2, device="cpu",
+                           kappa1=1.0, H_holdout=Hh.numpy()[None], verbose=False)
+assert log["obj_final"] <= log["obj_init"] + 1e-6, "calib objective rose"
+g0 = log["groups"][0]
+print(f" calib obj {log['obj_init']:.4f} -> {log['obj_final']:.4f} | holdout tracked={'mse_holdout_after_cd' in g0}")
 print(" OK\n")
+
 print("ALL TESTS PASSED")
