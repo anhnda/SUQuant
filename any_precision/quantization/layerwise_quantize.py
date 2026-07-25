@@ -341,12 +341,36 @@ def seed_layer(
         init_centroids = module_init_centroids.reshape(output_dim, n_cluster) # Shape: (output_dim, n_cluster)
         reshaped_module_weight = module_weight.reshape(output_dim, input_dim) # Shape: (output_dim, input_dim)
 
-        if solver == "lnqflexnu":
+        if solver == "lnqbopt":
+            # Stage 1: LNQ to convergence (same as the plain solver).
+            labels, C, lnq_log = train_least_squares(
+                reshaped_module_weight, init_labels, init_centroids,
+                module_hessian,
+                num_iterations=num_iterations, cd_cycles=cd_cycles,
+            )
+            # Stage 2: staged B-opt on top of LNQ's (labels, C).
+            from .layerwise_bopt import bopt_refine
+            bk = dict(flexnu_kwargs or {})   # reuse the passthrough dict for knobs
+            bopt_stages = int(bk.pop("bopt_stages", 1))
+            labels, C, bopt_log = bopt_refine(
+                reshaped_module_weight, module_hessian, labels, C,
+                stages=bopt_stages,
+                nu=int(bk.pop("bopt_nu", 32)),
+                top_p=int(bk.pop("bopt_top_p", 200)),
+                kappa1=float(bk.pop("bopt_kappa1", 2.0)),
+                max_cd_sweeps=int(bk.pop("bopt_max_cd_sweeps", 20)),
+                chain_depth=int(bk.pop("bopt_chain_depth", 18)),
+                n_chains=int(bk.pop("bopt_n_chains", 200)),
+            )
+            log_dict = {"lnq_log": lnq_log, "bopt_log": bopt_log}
+        elif solver == "lnqflexnu":
+            _fk = {k: v for k, v in (flexnu_kwargs or {}).items()
+                   if not k.startswith("bopt_")}
             labels, C, log_dict = train_lnq_flexnu(
                 reshaped_module_weight, init_labels, init_centroids,
                 module_hessian,
                 num_iterations=num_iterations, cd_cycles=cd_cycles,
-                **(flexnu_kwargs or {}),
+                **_fk,
             )
         elif solver == "flexnu":
             labels, C, log_dict = train_flexnu(...)      # unchanged
