@@ -149,6 +149,14 @@ def main():
     # pack reads the ORIGINAL fp16 shapes/metadata, then fills from the LUT cache.
     analyzer = get_analyzer(args.model, yaml_path=args.yaml_path, include_tokenizer=True)
     from any_precision.quantization.pack import pack
+    # CRITICAL: drop original .weight keys before packing. pack() only ADDS
+    # .qweight/.lut and never removes .weight, so if the originals stay in the
+    # state_dict they (a) bloat the checkpoint and (b) get copied back over the
+    # dequantized weights by dequant_to_hf.py's "copy unquantized remainder"
+    # loop -> the exported HF model would silently be the ORIGINAL fp16 model.
+    # The stock pipeline (layerwise_main.py) does this at line 193; the seq
+    # path must too.
+    analyzer.drop_original_weights()
     pack(
         analyzer=analyzer,
         lut_path=out_cache,
