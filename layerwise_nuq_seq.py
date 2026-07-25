@@ -52,6 +52,8 @@ def main():
                    choices=["clean", "dirty"],
                    help="clean: cached end-loss saliency (GuidedQuant). "
                         "dirty: per-block backward (not implemented).")
+    p.add_argument("--no_pack", action="store_true",
+                   help="Stop after quantize; do not build the packed model.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -124,7 +126,38 @@ def main():
         flexnu_kwargs={},
         sal_mode=args.sal_mode,
     )
-    logging.info("Done. Pack with the stock pack step pointed at the _seq output folder.")
+
+    # ----- pack (unless --no_pack) -----
+    if args.no_pack:
+        logging.info(f"Quantize done. Packed model NOT built (--no_pack). "
+                     f"LUT/labels are in: {out_cache}")
+        return
+
+    packed_out = (f"{cd}/layerwise_packed/"
+                  f"layerwise-{model_name}-w{args.seed_precision}"
+                  f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}_g{args.num_groups}"
+                  f"_iter{args.num_iterations}_cd{args.cd_cycles}"
+                  f"{'' if args.solver == 'lnq' else '_' + args.solver}_seq")
+
+    if os.path.exists(packed_out) and os.listdir(packed_out):
+        logging.info(f"Packed model already exists at {packed_out}; skipping pack.")
+        logging.info("Done.")
+        return
+
+    logging.info("------------------- Pack -------------------")
+    # the overwrite step mutated in-memory weights; reload a clean analyzer so
+    # pack reads the ORIGINAL fp16 shapes/metadata, then fills from the LUT cache.
+    analyzer = get_analyzer(args.model, yaml_path=args.yaml_path, include_tokenizer=True)
+    from any_precision.quantization.pack import pack
+    pack(
+        analyzer=analyzer,
+        lut_path=out_cache,
+        output_model_path=packed_out,
+        seed_precision=args.seed_precision,
+        parent_precision=args.seed_precision,
+        cpu_count=None,
+    )
+    logging.info(f"Done. Packed model: {packed_out}")
 
 
 if __name__ == "__main__":
