@@ -72,11 +72,12 @@ def main():
     init_cache = (f"{cd}/quantized/"
                   f"{model_name}-w{args.seed_precision}_orig{args.seed_precision}"
                   f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}")
+    _sal_suffix = "_dsal" if args.sal_mode == "dirty" else ""
     out_cache = (f"{cd}/layerwise_quantized/"
                  f"{model_name}-w{args.seed_precision}"
                  f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}_g{args.num_groups}"
                  f"_iter{args.num_iterations}_cd{args.cd_cycles}"
-                 f"{'' if args.solver == 'lnq' else '_' + args.solver}_seq")
+                 f"{'' if args.solver == 'lnq' else '_' + args.solver}_seq{_sal_suffix}")
 
     logging.info(f"Tokens cache:       {tokens_cache}")
     logging.info(f"Saliency cache:     {saliency_cache}")
@@ -90,19 +91,24 @@ def main():
     tokens = get_tokens(args.dataset, "train", analyzer.tokenizer,
                         args.seq_len, args.num_examples, tokens_cache, args.random_state)
 
-    # ----- saliency cache must exist (clean end-loss gradients) -----
-    need = [os.path.join(saliency_cache, f"l{i}.pt") for i in range(analyzer.num_layers)]
-    if not all(os.path.exists(f) for f in need):
-        logging.info("Saliency cache missing; generating clean end-loss saliency...")
-        from any_precision.quantization.gradients import get_gradients
-        os.makedirs(saliency_cache, exist_ok=True)
-        get_gradients(
-            analyzer, tokens,
-            save_path=None, saliency_path=saliency_cache,
-            num_groups=args.num_groups, skip_save_gradients=True,
-        )
-        # reload analyzer: gradient pass may have moved/hooked the model
-        analyzer = get_analyzer(args.model, yaml_path=args.yaml_path, include_tokenizer=True)
+    # ----- saliency cache: only needed for clean mode -----
+    if args.sal_mode == "clean":
+        need = [os.path.join(saliency_cache, f"l{i}.pt") for i in range(analyzer.num_layers)]
+        if not all(os.path.exists(f) for f in need):
+            logging.info("Saliency cache missing; generating clean end-loss saliency...")
+            from any_precision.quantization.gradients import get_gradients
+            os.makedirs(saliency_cache, exist_ok=True)
+            get_gradients(
+                analyzer, tokens,
+                save_path=None, saliency_path=saliency_cache,
+                num_groups=args.num_groups, skip_save_gradients=True,
+            )
+            # reload analyzer: gradient pass may have moved/hooked the model
+            analyzer = get_analyzer(args.model, yaml_path=args.yaml_path, include_tokenizer=True)
+    else:
+        logging.info("sal_mode=dirty: saliency is computed LIVE per block via a "
+                     "real end-loss backward through the partially-quantized model. "
+                     "No clean saliency cache is used.")
 
     if not os.path.exists(init_cache):
         logging.error(f"Initialization cache {init_cache} missing. "
@@ -137,7 +143,7 @@ def main():
                   f"layerwise-{model_name}-w{args.seed_precision}"
                   f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}_g{args.num_groups}"
                   f"_iter{args.num_iterations}_cd{args.cd_cycles}"
-                  f"{'' if args.solver == 'lnq' else '_' + args.solver}_seq")
+                  f"{'' if args.solver == 'lnq' else '_' + args.solver}_seq{_sal_suffix}")
 
     if os.path.exists(packed_out) and os.listdir(packed_out):
         logging.info(f"Packed model already exists at {packed_out}; skipping pack.")

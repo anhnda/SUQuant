@@ -172,10 +172,12 @@ def seed_sequential(
     flexnu_kwargs: dict = None,
     sal_mode: str = "clean",
 ):
-    assert sal_mode == "clean", (
-        "Only clean-saliency dirty-stream is wired up. "
-        "dirty-saliency needs a per-block backward (see module docstring)."
-    )
+    assert sal_mode in ("clean", "dirty"), f"unknown sal_mode {sal_mode}"
+    if sal_mode == "dirty":
+        return _seed_sequential_dirty_saliency(
+            analyzer, module_names, tokens, initialization_path, output_folder,
+            seed_precision, num_iterations, cd_cycles, num_groups, solver, flexnu_kwargs,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     group_count = 1
@@ -280,3 +282,203 @@ def _reload_quant(output_folder, seed_precision, module_names, l):
     luts_by_bit_by_module = [[lut[nm]] for nm in module_names]
     parent_weights = [w[nm] for nm in module_names]
     return luts_by_bit_by_module, parent_weights
+
+
+# =========================================================================== #
+#  DIRTY-SALIENCY sequential sweep                                            #
+#  --------------------------------------------------------------------------- #
+#  Per block l (input -> output order):                                        #
+#    (a) REAL END LOSS: run the FULL model (blocks 0..l-1 already fake-quant-  #
+#        overwritten, blocks l..L-1 still original) with labels=input_ids, so  #
+#        outputs.loss is the genuine next-token causal-LM cross-entropy at the #
+#        LM head -- the same end loss GuidedQuant uses. loss.backward() gives  #
+#        d(end loss)/d z^(l) at every module output of block l, flowing back   #
+#        through the (clean) downstream blocks and the head.                   #
+#    (b) reduce that gradient exactly like gradients.py: (1e3*grad)^2, grouped #
+#        channel-mean -> saliency (N, seq_len, num_groups).                    #
+#    (c) build the DIRTY Hessian  H~ = X~^T diag(s_dirty) X~  from the current #
+#        dirty input to block l and this dirty saliency.                       #
+#    (d) run the UNCHANGED LNQ solver.                                         #
+#    (e) FAKE-QUANT OVERWRITE block l (dequant -> .data.copy_), so the next    #
+#        block's forward+backward flows through the now-quantized block l.     #
+#                                                                              #
+#  The whole model stays resident and differentiable throughout, because the  #
+#  backward reaches the head at every step. Cost: L full fwd+bwd passes over   #
+#  the calib set (fine for 1B; this is the expensive-but-faithful path).       #
+# =========================================================================== #
+@torch.enable_grad()
+def _capture_block_saliency(
+    analyzer,
+    layer_idx: int,
+    module_names: List[str],
+    tokens,
+    num_groups: int,
+    device: torch.device,
+):
+    """
+    Real end-loss saliency for ONE block, at the CURRENT (partially-quantized)
+    operating point. Returns {module_name -> (N, seq_len, num_groups)} float,
+    matching the layout that _build_block_hessians / SaliencyEngine expect.
+    """
+    model = analyzer.model
+    layer = analyzer.get_layers()[layer_idx]
+    modules = analyzer.get_modules(layer)
+
+    # chunk-lists per module, exactly like gradients.py
+    saliency_chunks: Dict[str, list] = {nm: [] for nm in module_names}
+
+    hooks = []
+
+    def make_fwd_hook(nm):
+        def fwd_hook(module, inp, out):
+            # `out` may be a tuple for some modules; linear returns a tensor
+            t = out[0] if isinstance(out, tuple) else out
+            t.retain_grad()
+
+            def grad_hook(grad):
+                bsz, seq_len, hidden = grad.shape
+                gsz = hidden // num_groups
+                gsq = (grad.float() * 1e3).pow(2).view(bsz, seq_len, num_groups, gsz)
+                saliency_chunks[nm].append(gsq.mean(-1).float().cpu())
+            t.register_hook(grad_hook)
+        return fwd_hook
+
+    for nm, mod in modules.items():
+        if nm in saliency_chunks:
+            hooks.append(mod.register_forward_hook(make_fwd_hook(nm)))
+
+    # Ensure params require grad so autograd builds the graph to the head.
+    # (Quantized upstream weights were written via .data.copy_ under no_grad;
+    #  they remain leaves and act as fixed constants in the graph -- exactly the
+    #  dirty operating point. We do not differentiate through the quantizer.)
+    prev_req = {}
+    for n, p in model.named_parameters():
+        prev_req[n] = p.requires_grad
+        p.requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+
+    was_training = model.training
+    model.eval()  # eval mode (no dropout) but grad still flows
+
+    data = tokens if tokens[0].dim() == 2 else [t.unsqueeze(0) for t in tokens]
+    for seq in data:
+        seq = seq.to(model.device if hasattr(model, "device") else device)
+        if seq.dim() == 1:
+            seq = seq.unsqueeze(0)
+        out = model(input_ids=seq, labels=seq)   # REAL end loss (next-token CE at head)
+        out.loss.backward()
+        model.zero_grad(set_to_none=True)         # clear weight grads; saliency already captured
+
+    for h in hooks:
+        h.remove()
+    for n, p in model.named_parameters():
+        p.requires_grad_(prev_req[n])
+    if was_training:
+        model.train()
+
+    return {nm: torch.cat(saliency_chunks[nm], dim=0) for nm in module_names}
+
+
+def _seed_sequential_dirty_saliency(
+    analyzer,
+    module_names: List[str],
+    tokens,
+    initialization_path: str,
+    output_folder: str,
+    seed_precision: int,
+    num_iterations: int,
+    cd_cycles: int,
+    num_groups: int,
+    solver: str,
+    flexnu_kwargs: dict,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    group_count = 1
+
+    from .layerwise_quantize import get_saver
+    layer_saver = get_saver(output_folder, seed_precision, seed_precision, module_names)
+
+    layers_to_process, completed = load_progress(
+        output_folder, seed_precision, seed_precision, analyzer.num_layers
+    )
+    if completed:
+        logging.info(f"[seq-dirty] resuming; done blocks re-forwarded to keep "
+                     f"the dirty stream + dirty backward correct: {completed}")
+
+    # whole model must stay resident & differentiable: move it to GPU once
+    model = analyzer.model
+    model.to(device)
+
+    # catch block-0 dirty input (clean at this point) for the Hessian geometry
+    model_seqlen = tokens[0].shape[-1]
+    data = tokens if tokens[0].dim() == 2 else [t.unsqueeze(0) for t in tokens]
+    inps_list, forward_args = get_inps(
+        analyzer=analyzer, data=data, model_seqlen=model_seqlen,
+        devices=[device], offload_activations=True,
+    )
+    inps = inps_list[0]
+    outs = torch.zeros_like(inps)
+
+    layers = analyzer.get_layers()
+    num_layers = len(layers)
+
+    pb = get_progress_bar(num_layers, "Sequential dirty-stream + dirty-saliency LNQ")
+
+    for l in range(num_layers):
+        layer = layers[l]
+
+        if l not in completed:
+            # ---- (a)+(b) REAL end-loss DIRTY saliency at current operating point ----
+            dirty_sal = _capture_block_saliency(
+                analyzer, l, module_names, tokens, num_groups, device,
+            )   # {nm -> (N, seq_len, num_groups)}
+
+            # ---- (c) DIRTY Hessian from dirty input + dirty saliency ----
+            hess = _build_block_hessians(
+                layer, module_names, inps, dirty_sal, device, **forward_args,
+            )
+
+            # ---- (d) UNCHANGED LNQ solver ----
+            model_layer = [
+                analyzer.get_layer_weights(l)[nm].float().numpy() for nm in module_names
+            ]
+            init_labels = torch.load(
+                os.path.join(initialization_path, "weights", f"l{l}.pt"))
+            init_centroids = torch.load(
+                os.path.join(initialization_path, f"lut_{seed_precision}", f"l{l}.pt"))
+            init_labels_layer = [init_labels[nm] for nm in module_names]
+            init_centroids_layer = [init_centroids[nm].astype(np.float32) for nm in module_names]
+            hessian_layer = [fix_hessian_shape(hess[nm]).float().numpy() for nm in module_names]
+
+            luts_by_bit_by_module, parent_weights, log_dict = seed_layer(
+                l, module_names, model_layer,
+                init_labels_layer, init_centroids_layer, hessian_layer,
+                seed_precision, group_count,
+                num_iterations=num_iterations, cd_cycles=cd_cycles,
+                solver=solver, flexnu_kwargs=flexnu_kwargs,
+            )
+            layer_saver(luts_by_bit_by_module, parent_weights, log_dict, l)
+        else:
+            luts_by_bit_by_module, parent_weights = _reload_quant(
+                output_folder, seed_precision, module_names, l)
+
+        # ---- (e) FAKE-QUANT OVERWRITE block l ----
+        modules = analyzer.get_modules(layer)
+        for m_idx, nm in enumerate(module_names):
+            W_hat = _dequant(parent_weights[m_idx], luts_by_bit_by_module[m_idx][0])
+            mod = modules[nm]
+            W_hat = W_hat.to(mod.weight.dtype).to(mod.weight.device)
+            assert W_hat.shape == mod.weight.shape, \
+                f"dequant shape {tuple(W_hat.shape)} != weight {tuple(mod.weight.shape)} ({nm})"
+            with torch.no_grad():
+                mod.weight.data.copy_(W_hat)
+        analyzer._model_weights.pop(l, None)
+
+        # ---- advance the dirty INPUT stream through the now-quantized block ----
+        _forward_block(layer, inps, outs, device, **forward_args)
+        inps, outs = outs, inps
+        torch.cuda.empty_cache()
+        pb.update(1)
+
+    pb.close()
+    logging.info("[seq-dirty] Sequential dirty-stream + dirty-saliency quantization complete.")
