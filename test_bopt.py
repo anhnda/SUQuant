@@ -74,7 +74,7 @@ print(" OK: exact pair-gain formula verified\n")
 
 print("=== Test 3: CD reaches a real 1-opt fixed point ===")
 Wg = Wt.clone(); cb = torch.tensor(C); idx = torch.tensor(labels, dtype=torch.long)
-idx, nflip, sweeps, trend = cd_to_fixed_point(Wg, Hgt, Hdiag, cb, idx, max_sweeps=50)
+idx, nflip, sweeps, trend, pol = cd_to_fixed_point(Wg, Hgt, Hdiag, cb, idx, max_sweeps=50)
 assert nflip == 0, f"CD did not converge: {nflip} flips after {sweeps} sweeps"
 E = _gather_cb(cb, idx) - Wg; G = E @ Hgt
 a, _, _ = _alt_gains(Wg, E, G, Hdiag, cb, idx)
@@ -205,5 +205,33 @@ assert e_after3 < base3 - 0.1, "B=3 accepted but energy did not drop"
 print(f" 2-opt point {base3:.3f}: B=2 leaves it (accept=0), "
       f"B=3 solves it {base3:.3f}->{e_after3:.3f}")
 print(" OK: B=3 reaches what B=2 structurally cannot\n")
+
+print("=== Test 9: greedy 1-opt polish reaches 1-opt from a bad start ===")
+# Feed a deliberately non-1-opt assignment; the greedy polish must return a
+# genuine 1-opt point (all single-flip gains >= 0) without relying on cyclic CD
+# convergence. This is the guard for oscillating layers like v_proj.
+_greedy_1opt = _bopt._greedy_1opt
+torch.manual_seed(9)
+dp = 48
+Ap = torch.randn(dp, dp) * 0.4; Hp = Ap @ Ap.T + torch.eye(dp) * 0.05; Hp = 0.5*(Hp+Hp.T)
+Hdp = torch.diagonal(Hp).clone()
+Rp, mp = 16, 4
+Wp = torch.randn(Rp, dp)
+cbp = torch.stack([torch.quantile(Wp[r], torch.linspace(0, 1, mp)) for r in range(Rp)])
+# start from a RANDOM (bad) assignment, not nearest-codeword
+idxp = torch.randint(0, mp, (Rp, dp))
+Ep = _gather_cb(cbp, idxp) - Wp
+ap, _, _ = _alt_gains(Wp, Ep, Ep @ Hp, Hdp, cbp, idxp)
+n_bad = int((ap < -1e-6).sum())
+assert n_bad > 0, "test setup: start was already 1-opt"
+idx_pol = _greedy_1opt(Wp, Hp, Hdp, cbp, idxp, max_iters=200)
+Epol = _gather_cb(cbp, idx_pol) - Wp
+apol, _, _ = _alt_gains(Wp, Epol, Epol @ Hp, Hdp, cbp, idx_pol)
+assert (apol >= -1e-6).all(), "greedy polish did NOT reach 1-opt"
+e0 = torch.einsum('ri,ij,rj->', Ep, Hp, Ep).item()
+e1 = torch.einsum('ri,ij,rj->', Epol, Hp, Epol).item()
+assert e1 <= e0 + 1e-6, "greedy polish raised energy"
+print(f" {n_bad} improving flips at start -> 0 after polish, energy {e0:.2f}->{e1:.2f}")
+print(" OK: polish guarantees a true 1-opt point (oscillation-proof)\n")
 
 print("ALL TESTS PASSED")

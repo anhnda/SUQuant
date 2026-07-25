@@ -162,7 +162,9 @@ def cd_to_fixed_point(
 
     Mirrors update_P's arithmetic but keeps sweeping until no assignment moves,
     so that any B-opt gain measured afterwards is a barrier, not CD truncation
-    (spec 1.1). Returns (idx, n_flips_last_sweep, sweeps_run, flip_trend).
+    (spec 1.1). Returns (idx, n_flips_last_sweep, sweeps_run, flip_trend,
+    polished_1opt). polished_1opt is True iff the returned point is a genuine
+    1-opt (always True on clean convergence; True after greedy polish otherwise).
     """
     R, d = W_g.shape
     Wq = _gather_cb(cb, idx)                       # (R,d)
@@ -211,7 +213,36 @@ def cd_to_fixed_point(
     # downstream energy is a true lower bound of what CD reached.
     if n_flips != 0:
         idx = best_idx
-    return idx, n_flips, sweeps, flip_trend
+        idx = _greedy_1opt(W_g, H_g, Hdiag, cb, idx, max_sweeps)
+        # verify the polish actually reached 1-opt (it should, being greedy)
+        E = _gather_cb(cb, idx) - W_g
+        a, _, _ = _alt_gains(W_g, E, E @ H_g, Hdiag, cb, idx)
+        polished_1opt = bool((a >= -1e-6).all())
+    else:
+        polished_1opt = True
+    return idx, n_flips, sweeps, flip_trend, polished_1opt
+
+
+@torch.no_grad()
+def _greedy_1opt(W_g, H_g, Hdiag, cb, idx, max_iters=20):
+    """Strictly-greedy single-flip descent (best flip per channel per iter).
+
+    Unlike fixed-order cyclic CD this cannot oscillate: each iteration strictly
+    lowers exact energy or stops. Used only to polish an oscillating CD result
+    into a true 1-opt point. Returns idx (modified copy semantics).
+    """
+    idx = idx.clone()
+    for _ in range(max_iters):
+        E = _gather_cb(cb, idx) - W_g
+        G = E @ H_g
+        a, dstar, q = _alt_gains(W_g, E, G, Hdiag, cb, idx)   # a<0 => improving
+        gbest, jbest = a.min(dim=1)                           # best flip per chan
+        take = gbest < -1e-9
+        if not bool(take.any()):
+            break
+        rows = take.nonzero(as_tuple=True)[0]
+        idx[rows, jbest[rows]] = q[rows, jbest[rows]]
+    return idx
 
 
 @torch.no_grad()
@@ -756,11 +787,12 @@ def bopt_refine(
             )
 
         # 1.1 CD to an actual 1-opt fixed point
-        idx, n_flips, sweeps, flip_trend = cd_to_fixed_point(
+        idx, n_flips, sweeps, flip_trend, polished_1opt = cd_to_fixed_point(
             W_g, H_g, Hdiag, cb, idx, max_sweeps=max_cd_sweeps)
         glog["cd_sweeps_to_fp"] = sweeps
         glog["cd_flips_last"] = n_flips
         glog["cd_converged"] = (n_flips == 0)
+        glog["cd_polished_1opt"] = polished_1opt
         glog["cd_flip_trend"] = flip_trend
         cb = solve_codebook(W_g, H_solve, idx, m)
         if verbose:
@@ -768,16 +800,34 @@ def bopt_refine(
                 # spec §1.1: "assert n_flips == 0, CD did not reach 1-opt;
                 # B-opt measurement invalid". We do not hard-crash a real run,
                 # but the measurement below is NOT a clean barrier probe.
-                tr = flip_trend[-min(5, len(flip_trend)):]
-                decreasing = len(flip_trend) >= 2 and flip_trend[-1] < flip_trend[0]
-                diag = ("still decreasing -- raise --bopt_max_cd_sweeps"
-                        if decreasing else
-                        "FLAT/oscillating -- best iterate kept; more sweeps won't help")
+                tr = flip_trend[-min(6, len(flip_trend)):]
+                # Classify from the RECENT tail, not first-vs-last (the first
+                # sweep always has huge flip counts, so last<first is useless).
+                # Oscillating: the last value is above the tail's own minimum
+                # (it bottomed out then bounced). Decreasing: last == tail min
+                # and the tail is trending down.
+                tail_min = min(tr)
+                osc = len(tr) >= 3 and flip_trend[-1] > tail_min * 1.5
+                still_down = (len(tr) >= 2 and flip_trend[-1] <= tail_min
+                              and tr[-1] < tr[0])
+                if osc:
+                    diag = ("OSCILLATING (flips bounced back up) -- best iterate "
+                            "kept; more sweeps will NOT converge this layer")
+                elif still_down:
+                    diag = "still decreasing -- raise --bopt_max_cd_sweeps"
+                else:
+                    diag = ("stalled near a plateau -- best iterate kept; "
+                            "marginal gains from more sweeps")
                 logging.warning(
                     f"[bopt][g{k}] §1.1 CD did NOT converge: {sweeps} sweeps, "
                     f"last flips={n_flips} (recent trend {tr}). {diag}. "
-                    f"B-opt gain here is CONFOUNDED with CD truncation."
+                    + ("Greedy polish recovered a true 1-opt point, so B-opt "
+                       "below is on solid ground."
+                       if polished_1opt else
+                       "Greedy polish did NOT reach 1-opt -- B-opt gain is "
+                       "CONFOUNDED with CD truncation.")
                 )
+                glog["cd_oscillating"] = bool(osc)
             else:
                 trunc = "  <-- LNQ's K=4 would have TRUNCATED here" if sweeps > 4 else ""
                 logging.info(
@@ -870,7 +920,7 @@ def bopt_refine(
             E_tp = _gather_cb(cb, idx) - W_g
             f_triples = _group_energy(E_tp, H_g).mean().item()
             # spec 3.2: one CD re-sweep, then codebook solve
-            idx, resweep_flips, _, _ = cd_to_fixed_point(
+            idx, resweep_flips, _, _, _ = cd_to_fixed_point(
                 W_g, H_g, Hdiag, cb, idx, max_sweeps=1)
             cb = solve_codebook(W_g, H_solve, idx, m)
             E = _gather_cb(cb, idx) - W_g
