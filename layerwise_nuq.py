@@ -43,7 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default=None,
                     help="Stable short name for cache paths (defaults to basename of model path)")
     parser.add_argument("--solver", type=str, default="lnq",
-                        choices=["lnq", "flexnu", "lnqflexnu"])
+                        choices=["lnq", "flexnu", "lnqflexnu", "lnqbopt"])
     parser.add_argument("--flexnu_iters", type=int, default=300)
     parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
     parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)
