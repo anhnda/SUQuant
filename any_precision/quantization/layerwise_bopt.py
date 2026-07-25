@@ -84,19 +84,27 @@ def _kappa(kappa1: float, log_n1: float, log_nB: float) -> float:
 def _log_stage(k: int, name: str, s: dict, f_before: float, f_after: float,
                d: int, kappa: float,
                mse_hold_before: Optional[float] = None,
-               mse_hold_after: Optional[float] = None) -> None:
+               mse_hold_after: Optional[float] = None,
+               R: int = 1) -> None:
     """Emit the §2.6 instrumentation for one stage of one group.
+
+    f_before / f_after are MEAN per-channel energies (for the readable % drop).
+    s['dE_released'] is a SUM over channels, so to express it as a fraction of
+    the objective we compare it against the TOTAL energy (mean * R).
 
     Item 5 (calib-vs-holdout) is the one that matters: calibration energy MUST
     drop (monotonicity). If held-out energy does not follow, the stage is
     harvesting estimation noise and kappa should be raised, not celebrated.
     """
-    rel = (f_before - f_after) / max(f_before, 1e-12)
+    rel = (f_before - f_after) / max(f_before, 1e-12)            # mean-scale drop
+    f_tot = max(f_before * R, 1e-12)                             # total energy
+    rel_released = s["dE_released"] / f_tot                      # committed frac
     msg = (
         f"[bopt][g{k}] {name}: "
         f"accept={s['n_accept']} "                          # item 1
         f"chans={100*s['frac_channels']:.1f}% "             # item 2
-        f"dE_released={s['dE_released']:.4e} ({100*rel:.3f}% of f) "  # item 3
+        f"dE_released={s['dE_released']:.4e} "
+        f"({100*rel_released:.3f}% of f, obj drop {100*rel:.3f}%) "  # item 3
         f"kappa={kappa:.2f}"
     )
     if "jump_hist" in s:                                    # item 4
@@ -154,7 +162,7 @@ def cd_to_fixed_point(
 
     Mirrors update_P's arithmetic but keeps sweeping until no assignment moves,
     so that any B-opt gain measured afterwards is a barrier, not CD truncation
-    (spec 1.1). Returns (idx, n_flips_last_sweep, sweeps_run).
+    (spec 1.1). Returns (idx, n_flips_last_sweep, sweeps_run, flip_trend).
     """
     R, d = W_g.shape
     Wq = _gather_cb(cb, idx)                       # (R,d)
@@ -162,6 +170,13 @@ def cd_to_fixed_point(
     Hn = H_g / Hdiag.view(1, -1)                   # divide columns by diag
     n_flips = -1
     sweeps = 0
+    flip_trend = []                                # per-sweep flip counts
+    # Guard against oscillation: keep the LOWEST-energy assignment seen, not the
+    # last (which may be a mid-cycle iterate). CD on an indefinite H is not
+    # guaranteed to converge; committing the best iterate keeps monotonicity.
+    best_E = (Wq - W_g)
+    best_energy = _group_energy(best_E, H_g).sum().item()
+    best_idx = idx.clone()
     for sweep in range(max_sweeps):
         sweeps += 1
         E = Wq - W_g                               # (R,d)
@@ -184,9 +199,19 @@ def cd_to_fixed_point(
             if e < d:
                 B[:, e:] += (Wq[:, s:e] - W_g[:, s:e]) @ Hn[s:e, e:]
         n_flips = moved
+        flip_trend.append(moved)
+        # keep best-energy iterate
+        cur_energy = _group_energy(Wq - W_g, H_g).sum().item()
+        if cur_energy < best_energy:
+            best_energy = cur_energy
+            best_idx = idx.clone()
         if moved == 0:
             break
-    return idx, n_flips, sweeps
+    # If CD never hit 0 flips, return the best iterate seen (not the last), so
+    # downstream energy is a true lower bound of what CD reached.
+    if n_flips != 0:
+        idx = best_idx
+    return idx, n_flips, sweeps, flip_trend
 
 
 @torch.no_grad()
@@ -733,23 +758,42 @@ def bopt_refine(
             )
 
         # 1.1 CD to an actual 1-opt fixed point
-        idx, n_flips, sweeps = cd_to_fixed_point(
+        idx, n_flips, sweeps, flip_trend = cd_to_fixed_point(
             W_g, H_g, Hdiag, cb, idx, max_sweeps=max_cd_sweeps)
         glog["cd_sweeps_to_fp"] = sweeps
         glog["cd_flips_last"] = n_flips
+        glog["cd_converged"] = (n_flips == 0)
+        glog["cd_flip_trend"] = flip_trend
         cb = solve_codebook(W_g, H_solve, idx, m)
         if verbose:
-            trunc = "  <-- LNQ's K=4 would have TRUNCATED here" if sweeps > 4 else ""
-            logging.info(
-                f"[bopt][g{k}] §1.1 CD->fixed point in {sweeps} sweeps "
-                f"(last-sweep flips={n_flips}){trunc}"
-            )
+            if n_flips != 0:
+                # spec §1.1: "assert n_flips == 0, CD did not reach 1-opt;
+                # B-opt measurement invalid". We do not hard-crash a real run,
+                # but the measurement below is NOT a clean barrier probe.
+                tr = flip_trend[-min(5, len(flip_trend)):]
+                decreasing = len(flip_trend) >= 2 and flip_trend[-1] < flip_trend[0]
+                diag = ("still decreasing -- raise --bopt_max_cd_sweeps"
+                        if decreasing else
+                        "FLAT/oscillating -- best iterate kept; more sweeps won't help")
+                logging.warning(
+                    f"[bopt][g{k}] §1.1 CD did NOT converge: {sweeps} sweeps, "
+                    f"last flips={n_flips} (recent trend {tr}). {diag}. "
+                    f"B-opt gain here is CONFOUNDED with CD truncation."
+                )
+            else:
+                trunc = "  <-- LNQ's K=4 would have TRUNCATED here" if sweeps > 4 else ""
+                logging.info(
+                    f"[bopt][g{k}] §1.1 CD->fixed point in {sweeps} sweeps "
+                    f"(converged, 0 flips){trunc}"
+                )
 
         # residual + G at the 1-opt point
         E = _gather_cb(cb, idx) - W_g
         G = E @ H_g                                  # (R,d): G[r] = H_g @ E[r]
         f_after_cd = _group_energy(E, H_g).mean().item()
+        f_after_cd_tot = _group_energy(E, H_g).sum().item()   # for release fracs
         glog["f_after_cd"] = f_after_cd
+        glog["f_after_cd_tot"] = f_after_cd_tot
         # §2.6 item 5: held-out energy baseline on a FRESH Hessian
         if Ht_hold is not None:
             mse_hold_before = _group_energy(E, Ht_hold[k]).mean().item()
@@ -793,7 +837,7 @@ def bopt_refine(
             if Ht_hold is not None:
                 mha = _group_energy(E, Ht_hold[k]).mean().item()
                 mhb = glog.get("mse_holdout_after_cd")
-            _log_stage(k, "S1(B=2)", s1, f_pre, f_post, d, kappa2, mhb, mha)
+            _log_stage(k, "S1(B=2)", s1, f_pre, f_post, d, kappa2, mhb, mha, R=gs)
 
         # --- Stage 2: B=3 --------------------------------------------------- #
         if stages >= 2:
@@ -805,7 +849,7 @@ def bopt_refine(
             E_tp = _gather_cb(cb, idx) - W_g
             f_triples = _group_energy(E_tp, H_g).mean().item()
             # spec 3.2: one CD re-sweep, then codebook solve
-            idx, resweep_flips, _ = cd_to_fixed_point(
+            idx, resweep_flips, _, _ = cd_to_fixed_point(
                 W_g, H_g, Hdiag, cb, idx, max_sweeps=1)
             cb = solve_codebook(W_g, H_solve, idx, m)
             E = _gather_cb(cb, idx) - W_g
@@ -825,7 +869,7 @@ def bopt_refine(
                 if Ht_hold is not None:
                     mha = _group_energy(E, Ht_hold[k]).mean().item()
                     mhb = glog.get("mse_holdout_after_cd")
-                _log_stage(k, "S2(B=3)", s2, f_pre, f_post, d, kappa3, mhb, mha)
+                _log_stage(k, "S2(B=3)", s2, f_pre, f_post, d, kappa3, mhb, mha, R=gs)
 
         # --- Stage 3: ejection chains -------------------------------------- #
         if stages >= 3:
@@ -843,19 +887,22 @@ def bopt_refine(
                 if Ht_hold is not None:
                     mha = _group_energy(E, Ht_hold[k]).mean().item()
                     mhb = glog.get("mse_holdout_after_cd")
-                _log_stage(k, "S3(chain)", s3, f_pre, f_post, d, kappa2, mhb, mha)
+                _log_stage(k, "S3(chain)", s3, f_pre, f_post, d, kappa2, mhb, mha, R=gs)
 
         f_final = _group_energy(E, H_g).mean().item()
+        f_final_tot = _group_energy(E, H_g).sum().item()
         glog["f_final"] = f_final
-        glog["dE_released_frac"] = (f_after_cd - f_final) / max(f_after_cd, 1e-12)
+        # total-energy drop (both numerator and denominator are sums)
+        glog["dE_released_frac"] = (f_after_cd_tot - f_final_tot) / max(f_after_cd_tot, 1e-12)
         # Gate on B-opt's OWN committed gain only (spec 2.7): sum of dE_released
         # reported by the stages, which counts only exact-accepted moves and
         # excludes the CD re-sweep cleanup that would otherwise inflate the gate.
+        # dE_released is a SUM over channels, so normalise by TOTAL energy.
         bopt_released = sum(
             glog.get(sk, {}).get("dE_released", 0.0)
             for sk in ("stage1", "stage2", "stage3")
         )
-        glog["bopt_release_frac"] = bopt_released / max(f_after_cd, 1e-12)
+        glog["bopt_release_frac"] = bopt_released / max(f_after_cd_tot, 1e-12)
 
         idx_all[lo:hi] = idx
         cb_all[lo:hi] = cb
