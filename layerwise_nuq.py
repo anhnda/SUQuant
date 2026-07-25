@@ -44,6 +44,15 @@ if __name__ == "__main__":
                     help="Stable short name for cache paths (defaults to basename of model path)")
     parser.add_argument("--solver", type=str, default="lnq",
                         choices=["lnq", "flexnu", "lnqflexnu", "lnqbopt"])
+    # --- staged B-opt knobs (only used when --solver lnqbopt) ---
+    parser.add_argument("--bopt_stages", type=int, default=1,
+                        help="1=B2 gating pass, 2=+B3, 3=+ejection chains")
+    parser.add_argument("--bopt_nu", type=int, default=32)
+    parser.add_argument("--bopt_top_p", type=int, default=200)
+    parser.add_argument("--bopt_kappa1", type=float, default=2.0)
+    parser.add_argument("--bopt_max_cd_sweeps", type=int, default=20)
+    parser.add_argument("--bopt_chain_depth", type=int, default=18)
+    parser.add_argument("--bopt_n_chains", type=int, default=200)
     parser.add_argument("--flexnu_iters", type=int, default=300)
     parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
     parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)
@@ -67,7 +76,11 @@ if __name__ == "__main__":
     # only pass options that are not None
     fk = {k[len("flexnu_"):]: v for k, v in vars(args).items()
           if k.startswith("flexnu_") and v is not None}
+    # B-opt knobs ride the same passthrough dict; the lnqbopt branch pops them.
+    for k, v in vars(args).items():
+        if k.startswith("bopt_") and v is not None:
+            fk[k] = v
     kw = {k: v for k, v in vars(args).items()
-      if v is not None and not k.startswith("flexnu_")}
+      if v is not None and not k.startswith("flexnu_") and not k.startswith("bopt_")}
     kw["flexnu_kwargs"] = fk
     layerwise_nuq(**kw)
