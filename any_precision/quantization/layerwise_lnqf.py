@@ -72,7 +72,9 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from .layerwise_quantize import train_least_squares
+# NOTE: `train_least_squares` is imported lazily inside the function below.
+# A top-level import here would create a circular import, because
+# layerwise_quantize.py imports this module at its own top level.
 
 
 @torch.no_grad()
@@ -136,6 +138,9 @@ def train_least_squares_firstorder(
     tagged in the log. Otherwise, shift the reconstruction target by a damped
     Newton step and hand the SAME LNQ solver the shifted target.
     """
+    # Lazy import to break the circular dependency with layerwise_quantize.
+    from .layerwise_quantize import train_least_squares
+
     if g_bar is None:
         logging.warning(
             "[lnqf] no first-order term supplied (g_bar=None) -> "

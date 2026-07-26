@@ -85,12 +85,26 @@ SKIP_FIRSTORDER=${SKIP_FIRSTORDER:-0}
 GBAR_ARG=""
 if [[ "$MODE_VAL" != "tokens" && "$MODE_VAL" != "hessians" ]]; then
   if [[ "$SKIP_FIRSTORDER" != "1" ]]; then
-    GBAR_PATH=$(python firstorder_cache.py "$MODEL_PATH" \
+    # NOTE: do NOT pipe python into tail -- a pipe hides python's exit code, so a
+    # crash in firstorder_cache.py would go unnoticed and we'd run with an empty
+    # path. Capture full stdout, check the exit code, then take the last line.
+    FO_OUT=$(python firstorder_cache.py "$MODEL_PATH" \
       --model_name "$MODEL_REF" \
       --dataset "$DATASET" --seq_len "$SEQ_LEN" --num_examples "$NUM_EXAMPLES" \
-      --random_state 42 | tail -n 1) || exit $?
+      --random_state 42)
+    FO_RC=$?
+    echo "$FO_OUT"
+    if [[ $FO_RC -ne 0 ]]; then
+      echo "[run_lnqf] first-order cache build FAILED (rc=$FO_RC). Aborting." >&2
+      exit $FO_RC
+    fi
+    GBAR_PATH=$(printf '%s\n' "$FO_OUT" | tail -n 1)
   else
     GBAR_PATH="cache/firstorder/${MODEL_REF##*/}-${DATASET}_s${NUM_EXAMPLES}_blk${SEQ_LEN}"
+  fi
+  if [[ -z "$GBAR_PATH" ]]; then
+    echo "[run_lnqf] could not determine first-order cache path. Aborting." >&2
+    exit 1
   fi
   GBAR_ARG="--lnqf_gbar_path $GBAR_PATH"
 fi
