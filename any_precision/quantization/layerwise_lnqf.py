@@ -65,9 +65,13 @@ def update_P_fo(
     """
     Cyclic-CD assignment update with the first-order term folded in.
 
-    Identical to layerwise_quantize.update_P, except the ROUNDING target is
-    w_i - g_bar_i/H_ii - B_i  instead of  w_i - B_i. B (the descent correction)
-    still uses the true (W_hat - W). Setting g_over_diag=None reproduces vanilla.
+    The exact coordinate minimizer of  phi = g^T u + 1/2 u^T H u  is
+        w_hat_i <- Round( w_i - (1/H_ii)( g_i + sum_{k!=i} H_ik (w_hat_k - w_k) ) ).
+    We fold g_i/H_ii into the DESCENT TERM B (which already carries the
+    sum_{k!=i} H_ik (.)/H_ii part), NOT into a static target shift. This is the
+    key fix: g_i/H_ii lives inside the dynamic B that CD updates every coordinate,
+    so a near-singular coordinate (H_ii ~ 0) can no longer park a huge static
+    offset outside the codebook. Setting g_over_diag=None reproduces vanilla.
     """
     device = torch.device("cuda")
     C = C.to(device)
@@ -88,13 +92,12 @@ def update_P_fo(
     C_grp = C.reshape(num_groups, group_size, C.shape[-1])
     W_hat_grp = W_hat.reshape(num_groups, group_size, d)
     H_grp = H.clone().to(device)
-    B_grp = torch.zeros_like(W_grp).to(device)
 
-    # rounding target = W - g_bar/diag(H); descent term B still uses true W.
+    # g_bar/diag(H) as a per-coordinate constant added INTO B (not the target).
     if g_over_diag is not None:
-        Wtgt_grp = (W - g_over_diag.to(device)).reshape(num_groups, group_size, d)
+        god_grp = g_over_diag.to(device).reshape(num_groups, group_size, d)
     else:
-        Wtgt_grp = W_grp
+        god_grp = None
 
     for i in range(num_groups):
         H_grp_diag = H_grp[i, torch.arange(d), torch.arange(d)].reshape(1, 1, -1)
@@ -103,13 +106,17 @@ def update_P_fo(
     cd_block_size = 128
 
     for k in range(cd_cycles):
+        # B carries the cross-coordinate correction; SEED it with g_bar/diag(H) so
+        # the first-order term rides inside the same dynamically-updated quantity.
         B_grp = torch.bmm(W_hat_grp - W_grp, torch.tril(H_grp, diagonal=-1))
+        if god_grp is not None:
+            B_grp = B_grp + god_grp
         for start_idx in range(0, d, cd_block_size):
             end_idx = min(start_idx + cd_block_size, d)
             for update_idx in range(start_idx, end_idx):
                 index = torch.arange(update_idx, update_idx + 1, device=device)
-                # ---- only change vs vanilla: Wtgt_grp instead of W_grp ----
-                sol = Wtgt_grp[:, :, index] - B_grp[:, :, index]
+                # target is the TRUE w_i; the g_i/H_ii part is already inside B.
+                sol = W_grp[:, :, index] - B_grp[:, :, index]
                 sol_dist = torch.abs(sol - C_grp)
                 min_dist, argmin_dist = sol_dist.min(dim=-1)
                 assignments[:, index] = argmin_dist.reshape(-1, 1)
@@ -258,54 +265,43 @@ def train_least_squares_firstorder(
         num_groups = H.shape[0]
         group_size = W.shape[0] // num_groups
         d = H.shape[1]
+        # diag(H) per coordinate. A handful of near-singular coords (H_ii -> 0)
+        # would make g_bar_i/H_ii explode. We FLOOR H_ii per-coordinate at a
+        # percentile of the diagonal (tau), which caps ONLY the degenerate tail
+        # and leaves the ~99% healthy coordinates untouched. This replaces the old
+        # global trust-region/gamma, which let the bad tail kill B1 everywhere.
+        diagH_all = torch.cat([H[gi, torch.arange(d), torch.arange(d)] for gi in range(num_groups)])
+        # tau = a low percentile of diag(H); floor keeps shift bounded at the tail.
+        tau = torch.quantile(diagH_all.float(), 0.10).item()
+        floor_frac = float(max_shift) if max_shift and max_shift > 0 else 1.0
+        tau = tau * floor_frac   # max_shift now tunes the floor (>1 => stronger floor)
+
         g_over_diag = torch.empty_like(g_bar_t)
+        n_floored = 0
         for gi in range(num_groups):
             r0, r1 = gi * group_size, (gi + 1) * group_size
-            diagH = H[gi, torch.arange(d), torch.arange(d)].clamp_min(1e-12)  # (in,)
-            g_over_diag[r0:r1] = g_bar_t[r0:r1] / diagH.unsqueeze(0)
+            diagH = H[gi, torch.arange(d), torch.arange(d)]
+            diagH_floored = diagH.clamp_min(tau)
+            n_floored += (diagH < tau).sum().item()
+            g_over_diag[r0:r1] = g_bar_t[r0:r1] / diagH_floored.unsqueeze(0)
 
-        # SAFETY TRUST-REGION (applied at the SOURCE, to g_bar itself, so BOTH the
-        # assignment branch (uses g_bar/diag(H)) and the codebook branch (uses
-        # L^{-1} g_bar) shrink by the SAME factor and stay mutually consistent).
-        # Rationale: if g_bar is over-scaled or its gradient statistic is
-        # inconsistent with H's squared saliency, an unbounded diagonal shift drags
-        # the deployed w_hat off the true weights -> the model breaks while phi (the
-        # surrogate) still looks small. We require the RMS diagonal shift to be at
-        # most `shift_cap` * RMS(|w|); if it exceeds that, scale g_bar down globally.
-        shift_cap = float(max_shift) if max_shift and max_shift > 0 else 0.10
-        rms_shift = g_over_diag.pow(2).mean().sqrt().item()
         rms_w = W.pow(2).mean().sqrt().item()
-        # DEBUG decomposition: is the big shift from g_bar being large, or from
-        # dividing by a small diag(H)? Report all three RMS magnitudes.
-        diagH_all = torch.cat([H[gi, torch.arange(d), torch.arange(d)] for gi in range(num_groups)])
-        # per-coordinate shift distribution: RMS hides the blow-up. Show min diagH
-        # and the tail of |shift|, since a handful of near-singular coords (H_ii~0)
-        # inflate RMS while the median stays sane.
         shift_abs = g_over_diag.abs()
         q = torch.tensor([0.5, 0.9, 0.99, 0.999, 1.0], device=g_over_diag.device)
         shift_q = torch.quantile(shift_abs.flatten().float(), q).tolist()
         logging.info(
             f"[lnqf-dbg] RMS(g_bar)={g_bar_t.pow(2).mean().sqrt().item():.3e} "
             f"diagH[min={diagH_all.min().item():.3e} med={diagH_all.median().item():.3e} "
-            f"max={diagH_all.max().item():.3e}] RMS(w)={rms_w:.3e}"
+            f"max={diagH_all.max().item():.3e}] tau_floor={tau:.3e} "
+            f"floored {100.0*n_floored/diagH_all.numel():.2f}% coords RMS(w)={rms_w:.3e}"
         )
         logging.info(
             f"[lnqf-dbg] |shift| quantiles [50%={shift_q[0]:.3e} 90%={shift_q[1]:.3e} "
             f"99%={shift_q[2]:.3e} 99.9%={shift_q[3]:.3e} max={shift_q[4]:.3e}] "
-            f"| median shift/w = {shift_q[0]/max(rms_w,1e-30):.4f}"
+            f"| median shift/w={shift_q[0]/max(rms_w,1e-30):.4f} "
+            f"max shift/w={shift_q[4]/max(rms_w,1e-30):.4f}"
         )
-        gamma = 1.0
-        if rms_shift > shift_cap * rms_w and rms_shift > 0:
-            gamma = shift_cap * rms_w / rms_shift
-            g_bar_t = g_bar_t * gamma
-            g_over_diag = g_over_diag * gamma
-        logging.info(
-            f"[lnqf] shift RMS={rms_shift:.3e} vs {shift_cap:.3g}*RMS(w)={shift_cap*rms_w:.3e} "
-            f"-> g_bar rescaled by gamma={gamma:.3e} "
-            f"(||shift||={g_over_diag.norm().item():.3e}, "
-            f"{100.0*g_over_diag.norm().item()/max(W.norm().item(),1e-12):.3f}% of ||w||)"
-        )
-        logging.info("[lnqf] first-order term folded into update_P/update_C (option A, no global H^{-1}).")
+        logging.info("[lnqf] first-order folded into B (dynamic descent), diagH floored, no trust-region.")
     else:
         logging.warning("[lnqf] g_bar=None -> vanilla LNQ (second-order only).")
 
