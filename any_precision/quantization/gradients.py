@@ -242,16 +242,27 @@ def get_gradients(
         mc_generator = torch.Generator(device=model.device)
         mc_generator.manual_seed(int(mc_seed))
 
+    _branch_logged = False
     for tokens in tqdm(input_tokens, desc="Calculating gradients"):
         tokens = tokens.to(model.device).unsqueeze(0)
         if mc_fisher:
             # MC GGN/Fisher: no label needed; sample pseudo-labels from the model.
             outputs = model(input_ids=tokens)
             loss = _mc_fisher_loss(outputs.logits, mc_samples, generator=mc_generator)
+            if not _branch_logged:
+                logging.info(f"[hessian-estimator] EXECUTING MC branch: "
+                             f"model called WITHOUT labels; loss=E_k[-log p(y~)], "
+                             f"K={mc_samples}, loss={float(loss):.6f}")
+                _branch_logged = True
         else:
             # Default: true-label empirical Fisher (HF mean-over-tokens CE).
             outputs = model(input_ids=tokens, labels=tokens)
             loss = outputs.loss
+            if not _branch_logged:
+                logging.info(f"[hessian-estimator] EXECUTING Fisher branch: "
+                             f"model called WITH labels; loss=HF CE, "
+                             f"loss={float(loss):.6f}")
+                _branch_logged = True
         loss.backward()
 
     # ----------------------------------------------------------------
