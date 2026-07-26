@@ -30,9 +30,15 @@ DATASET=${DATASET:-c4}
 SEQ_LEN=${SEQ_LEN:-2048}
 NUM_EXAMPLES=${NUM_EXAMPLES:-128}
 
+MC_OPT=""
+if [[ -n "$MC_SAMPLES" ]]; then
+  MC_OPT="--mc_fisher true --mc_samples $MC_SAMPLES"
+  [[ -n "$MC_SEED" ]] && MC_OPT="$MC_OPT --mc_seed $MC_SEED"
+fi
+
 python layerwise_nuq_seq.py "$MODEL_PATH" \
   --model_name "$MODEL_REF" \
   --seed_precision "$BITS" \
   --dataset "$DATASET" --seq_len "$SEQ_LEN" --num_examples "$NUM_EXAMPLES" \
   --num_groups "$NUM_GROUPS" --random_state 42 \
-  --sal_mode "$SAL_MODE"
+  --sal_mode "$SAL_MODE" $MC_OPT
