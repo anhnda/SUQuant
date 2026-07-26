@@ -252,7 +252,16 @@ def train_least_squares(
         # needed, adapts per module. Shrinkage is only mildly sensitive to gamma, so
         # the PR proxy suffices; pass AP_MP_NEFF to override with a measured Kish value.
         if mp_n_eff is not None:
-            n_eff_arg = mp_n_eff
+            # mp_n_eff may be a scalar or a per-group tensor/list (Kish n_eff from
+            # the saliency cache). Pass it straight through; denoise_hessian handles
+            # both. This is the CORRECT gamma_eff, per module and per group.
+            if torch.is_tensor(mp_n_eff):
+                n_eff_arg = [float(x) for x in mp_n_eff.flatten().tolist()]
+            elif isinstance(mp_n_eff, (list, tuple)):
+                n_eff_arg = [float(x) for x in mp_n_eff]
+            else:
+                n_eff_arg = float(mp_n_eff)
+            logging.info(f"[MP-TR] using measured Kish n_eff: {n_eff_arg} (d={d_in})")
         else:
             n_eff_list = []
             for i in range(H.shape[0]):
@@ -393,6 +402,7 @@ def seed_layer(
     cd_cycles: int = 4,
     solver: str = "lnq",
     flexnu_kwargs: dict = None,
+    neff_layer: List = None,
 ) -> Tuple[List[List[np.ndarray]], List[np.ndarray]]:
     lut_by_bit_by_module = []
     parent_weights_by_modules = []
@@ -408,6 +418,7 @@ def seed_layer(
         module_init_labels = layer_init_labels[m_idx]
         module_init_centroids = layer_init_centroids[m_idx]
         module_hessian = layer_hessian[m_idx]
+        module_neff = neff_layer[m_idx] if neff_layer is not None else None
 
         assert group_count == 1, "Group-wise quantization is not supported yet"
 
@@ -430,6 +441,7 @@ def seed_layer(
                 reshaped_module_weight, init_labels, init_centroids,
                 module_hessian,
                 num_iterations=num_iterations, cd_cycles=cd_cycles,
+                mp_n_eff=module_neff,
             )
             # Stage 2: staged B-opt on top of LNQ's (labels, C).
             from .layerwise_bopt import bopt_refine
@@ -495,6 +507,7 @@ def seed_layer(
                 reshaped_module_weight, init_labels, init_centroids,
                 module_hessian,
                 num_iterations=num_iterations, cd_cycles=cd_cycles,
+                mp_n_eff=module_neff,
             )
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
         labels = labels.reshape(output_dim, 1, input_dim) # Shape: (output_dim, 1, input_dim)
@@ -522,7 +535,7 @@ def fix_hessian_shape(H: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Invalid Hessian shape: {H.shape}")
 
 
-def get_layer_loader(analyzer, module_names, initialization_path, hessians_path, seed_precision):
+def get_layer_loader(analyzer, module_names, initialization_path, hessians_path, seed_precision, saliency_path=None):
     def layer_loader(l):
         # Load the initialization data (labels and centroids)
         init_labels_file_name = os.path.join(initialization_path, "weights", f"l{l}.pt")
@@ -531,6 +544,15 @@ def get_layer_loader(analyzer, module_names, initialization_path, hessians_path,
         init_centroids = torch.load(init_centroids_file_name)
         hessian_file_name = os.path.join(hessians_path, f"l{l}.pt")
         hessian = torch.load(hessian_file_name)
+
+        # Effective sample size per module/group (Kish), saved next to saliency.
+        # Used by the MP trust-region to set gamma_eff = d / n_eff correctly per
+        # module (n_eff varies ~1000x across modules). None if unavailable.
+        neff = None
+        if saliency_path is not None:
+            neff_file = os.path.join(saliency_path, f"l{l}_neff.pt")
+            if os.path.isfile(neff_file):
+                neff = torch.load(neff_file, map_location="cpu")
 
         # Organize the data by module
         init_labels_layer = [
@@ -546,7 +568,12 @@ def get_layer_loader(analyzer, module_names, initialization_path, hessians_path,
             analyzer.get_layer_weights(l)[name].float().numpy()
             for name in module_names
         ]
-        return module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer
+        # n_eff per module (each entry: tensor[num_groups] or None)
+        neff_layer = [
+            (neff[name] if (neff is not None and name in neff) else None)
+            for name in module_names
+        ]
+        return module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer, neff_layer
 
     return layer_loader
 
@@ -633,7 +660,8 @@ def seed(
     cd_cycles: int = 4,
     sub_qlayer: Tuple[int, int] = None,
     solver: str = "lnq",
-    flexnu_kwargs: dict = None
+    flexnu_kwargs: dict = None,
+    saliency_path: str = None,
 
 ):
     group_count = 1
@@ -674,7 +702,8 @@ def seed(
     logging.info(f"Quantizing layers {layers_to_process}")
 
     layer_loader = get_layer_loader(
-        analyzer, module_names, initialization_path, hessians_path, seed_precision
+        analyzer, module_names, initialization_path, hessians_path, seed_precision,
+        saliency_path=saliency_path
     )
     layer_saver = get_saver(
         output_folder, seed_precision, seed_precision, module_names
@@ -687,7 +716,7 @@ def seed(
                 if l == layers_to_process[0]:
                     future_load = io_executor.submit(layer_loader, l)
 
-                module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer = future_load.result()
+                module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer, neff_layer = future_load.result()
 
                 if l != layers_to_process[-1]:
                     future_load = io_executor.submit(layer_loader, l + 1)
@@ -705,6 +734,7 @@ def seed(
                     cd_cycles=cd_cycles,
                     solver=solver,
                     flexnu_kwargs=flexnu_kwargs,
+                    neff_layer=neff_layer,
                 )
 
                 io_executor.submit(
@@ -716,7 +746,7 @@ def seed(
     else:
         pb = get_progress_bar(len(layers_to_process), "Quantizing layers...")
         for l in layers_to_process:
-            module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer = layer_loader(l)
+            module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer, neff_layer = layer_loader(l)
 
             luts_by_bit_by_module, parent_weights, log_dict = seed_layer(
                 l,
@@ -731,6 +761,7 @@ def seed(
                 cd_cycles=cd_cycles,
                 solver=solver,
                 flexnu_kwargs=flexnu_kwargs,
+                neff_layer=neff_layer,
             )
 
             layer_saver(luts_by_bit_by_module, parent_weights, log_dict, l)

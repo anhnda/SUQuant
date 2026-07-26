@@ -311,12 +311,30 @@ def denoise_hessian(
     """
     num_groups, d, _ = H.shape
     if not torch.is_tensor(n_eff):
-        n_eff_list = [float(n_eff)] * num_groups if not isinstance(n_eff, (list, tuple)) \
-            else [float(x) for x in n_eff]
+        if isinstance(n_eff, (list, tuple)):
+            n_eff_list = [float(x) for x in n_eff]
+        else:
+            n_eff_list = [float(n_eff)] * num_groups
     else:
         n_eff_list = [float(x) for x in n_eff.flatten().tolist()]
+
+    # Reconcile length with num_groups. Saliency n_eff was computed at the ORIGINAL
+    # grouping; if H was re-grouped to fewer groups, average the n_eff entries that
+    # fall into each target group (harmonic-style average is closer to how sample
+    # sizes combine, but arithmetic mean is fine here as a proxy).
+    if len(n_eff_list) != num_groups:
         if len(n_eff_list) == 1:
             n_eff_list = n_eff_list * num_groups
+        elif len(n_eff_list) % num_groups == 0:
+            per = len(n_eff_list) // num_groups
+            n_eff_list = [
+                sum(n_eff_list[i * per:(i + 1) * per]) / per
+                for i in range(num_groups)
+            ]
+        else:
+            # Fallback: use the mean for all groups.
+            m = sum(n_eff_list) / len(n_eff_list)
+            n_eff_list = [m] * num_groups
 
     out = torch.empty_like(H)
     for i in range(num_groups):

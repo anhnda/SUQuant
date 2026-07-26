@@ -1,4 +1,3 @@
-
 import os
 import os.path
 import shutil
@@ -199,6 +198,7 @@ def layerwise_nuq(
         sub_qlayer=sub_qlayer,
         solver=solver,
         flexnu_kwargs=flexnu_kwargs,
+        saliency_path=saliency_cache_path,
     )
 
     if mode == 'quantize':
