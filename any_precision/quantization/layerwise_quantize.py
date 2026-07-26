@@ -416,6 +416,13 @@ def seed_layer(
             g_bar = _load_firstorder_term(
                 lnqf_gbar_path, l, module_name, output_dim, input_dim
             )
+            # Verification switch: LNQF_DISABLE_GBAR=1 forces g_bar=None so LNQ-F
+            # runs the pure vanilla path. If the resulting PPL matches run_lnq.sh,
+            # the pack/deploy/CD pipeline is proven correct and any breakage is
+            # isolated to the first-order term itself.
+            if os.environ.get("LNQF_DISABLE_GBAR", "0") == "1":
+                g_bar = None
+                logging.warning("[lnqf] LNQF_DISABLE_GBAR=1 -> forcing vanilla path (g_bar=None).")
             labels, C, log_dict = train_least_squares_firstorder(
                 reshaped_module_weight, init_labels, init_centroids,
                 module_hessian,

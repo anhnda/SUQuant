@@ -179,6 +179,20 @@ def update_C_fo(
             rhs = g_bar[r0:r1].to(device).transpose(0, 1)          # (in, group_size)
             zi = torch.linalg.solve_triangular(L[gi], rhs, upper=False)  # (in, group_size)
             z_all[r0:r1] = zi.transpose(0, 1)
+        # DEBUG: the codebook RHS is shifted by L^{-1} g_bar (in the reduced/L^T
+        # space). This is NOT the same as the deployed-weight shift, but if it is
+        # huge it signals the codebook is being pulled to a wildly shifted target.
+        # Compare against ||L^T w|| (the un-shifted RHS) at same scale.
+        LTw = torch.empty_like(W)
+        for gi in range(num_groups):
+            r0, r1 = gi * group_size, (gi + 1) * group_size
+            LTw[r0:r1] = (reduced_X[gi] @ W[r0:r1].T).T
+        logging.info(
+            f"[lnqf-dbg] update_C: ||L^-1 g_bar||={z_all.norm().item():.3e} "
+            f"||L^T w||={LTw.norm().item():.3e} "
+            f"ratio={z_all.norm().item()/max(LTw.norm().item(),1e-30):.4f} "
+            f"(RHS shift as fraction of RHS)"
+        )
 
     assert channel_size // sub_channel_size >= num_groups
     assert channel_size % (sub_channel_size * num_groups) == 0
