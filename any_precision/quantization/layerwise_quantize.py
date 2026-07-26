@@ -243,24 +243,32 @@ def train_least_squares(
         # scale-free) instead of a tuned damping constant, and keeps only BBP spikes.
         # Result is PD by construction, so the Cholesky/update_C/update_P path below
         # runs unchanged.
-        from .mp_trust_region import denoise_hessian, effective_sample_size
+        from .mp_trust_region import denoise_hessian
         d_in = H.shape[1]
+        # n_eff varies wildly across modules (measured 22..25000), so one hand-passed
+        # value is wrong for most layers. If mp_n_eff isn't given, estimate n_eff PER
+        # GROUP from H via the spectral participation ratio PR = (tr H)^2 / tr(H^2),
+        # which tracks how concentrated the saliency-weighted spectrum is. No file
+        # needed, adapts per module. Shrinkage is only mildly sensitive to gamma, so
+        # the PR proxy suffices; pass AP_MP_NEFF to override with a measured Kish value.
         if mp_n_eff is not None:
-            n_eff = mp_n_eff
+            n_eff_arg = mp_n_eff
         else:
-            # No token-level saliency here; fall back to a conservative proxy.
-            # n (calib tokens) is unknown at this call, so use env or a safe default.
-            n_eff = float(_os.environ.get("AP_MP_NEFF_FALLBACK", str(max(4 * d_in, 4096))))
-            logging.warning(
-                f"[MP-TR] n_eff not provided; using fallback n_eff={n_eff:.0f} "
-                f"(gamma_eff={d_in / n_eff:.3f}). For a correct MP threshold, pass "
-                f"AP_MP_NEFF measured from saliency (Kish n_eff)."
-            )
+            n_eff_list = []
+            for i in range(H.shape[0]):
+                Hi = H[i].double()
+                tr = torch.trace(Hi)
+                tr2 = torch.trace(Hi @ Hi).clamp_min(1e-30)
+                pr = float((tr * tr / tr2).item())
+                n_eff_list.append(min(max(pr, d_in / 50.0), 50.0 * d_in))
+            n_eff_arg = n_eff_list
+            logging.info(f"[MP-TR] auto n_eff per-group (spectral PR): "
+                         f"{[round(x) for x in n_eff_list]} (d={d_in})")
         logging.info(f"[MP-TR] Denoising H via RMT trust-region "
                      f"(mode={_os.environ.get('AP_MP_MODE', 'shrinkage')}, "
                      f"k_max={mp_k_max}); replacing damping loop.")
         _mp_mode = _os.environ.get("AP_MP_MODE", "shrinkage")
-        H = denoise_hessian(H, n_eff, k_max=mp_k_max, mode=_mp_mode, verbose=True)
+        H = denoise_hessian(H, n_eff_arg, k_max=mp_k_max, mode=_mp_mode, verbose=True)
         # sanity: every group must now be PD for the downstream Cholesky.
         for i in range(H.shape[0]):
             try:
