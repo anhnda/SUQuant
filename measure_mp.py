@@ -26,13 +26,23 @@ you turn the trust region on.
 """
 import argparse
 import os
+import sys
+import importlib.util
 import torch
 import functools
 torch.load = functools.partial(torch.load, weights_only=False)
 
-from any_precision.quantization.mp_trust_region import (
-    _whiten, _bulk_sigma2, mp_edges, effective_sample_size,
-)
+# Import mp_trust_region DIRECTLY from its file to avoid pulling the whole
+# any_precision package (transformers/tqdm/etc.) just to run a measurement.
+_MP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "any_precision", "quantization", "mp_trust_region.py")
+_spec = importlib.util.spec_from_file_location("mp_trust_region", _MP_PATH)
+_mp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mp)
+_whiten = _mp._whiten
+_bulk_sigma2 = _mp._bulk_sigma2
+mp_edges = _mp.mp_edges
+effective_sample_size = _mp.effective_sample_size
 
 
 def spectrum_report(H_g, gamma_eff):
@@ -93,12 +103,17 @@ def main():
             if os.path.exists(neff_path):
                 neff_layer = torch.load(neff_path, map_location="cpu")
 
-        # H_layer: { module_name -> tensor (num_groups, d, d) } (or similar)
+        # H_layer: { module_name -> tensor }. The stored XTX has shape (D, D, G)
+        # (group axis LAST); normalize to (G, D, D) like fix_hessian_shape does.
         for module_name, H in H_layer.items():
             if H is None:
                 continue
             if H.dim() == 2:
-                H = H.unsqueeze(0)
+                H = H.unsqueeze(0)                       # (1, D, D)
+            elif H.dim() == 3:
+                if H.shape[0] == H.shape[1]:
+                    H = H.permute(2, 0, 1).contiguous()  # (D,D,G) -> (G,D,D)
+                # else already (G, D, D)
             num_groups = H.shape[0]
             for g in range(min(num_groups, args.max_groups)):
                 # resolve n_eff for this module/group
