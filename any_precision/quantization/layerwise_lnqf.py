@@ -144,17 +144,19 @@ def update_C_fo(
     H: torch.Tensor,        # (g, in, in)
     labels: torch.Tensor,   # (out, in)
     C: torch.Tensor,        # (out, n_cluster)
-    g_bar: Optional[torch.Tensor] = None,  # (out, in)
+    g_over_diag: Optional[torch.Tensor] = None,  # (out, in) = g_bar/diag(H) FLOORED
 ):
     """
-    Closed-form codebook update with the first-order term folded in.
+    Closed-form codebook update, CONSISTENT with update_P_fo.
 
-    Solves, per output channel, the SAME regularized least squares as
-    layerwise_quantize.update_C but with RHS  b = L^T w - L^{-1} g_bar, so the
-    normal equations read  (P^T H P) c = P^T H w - P^T g_bar  (Eq. 9 + B1).
-    The (m x m) system solved by lstsq is unchanged; only b shifts. The L^{-1}
-    is a single triangular solve with the already-computed Cholesky factor L,
-    NOT a full H^{-1}. g_bar=None reproduces vanilla update_C exactly.
+    Both updates must aim the reconstruction at the SAME shifted target
+        w_tilde = w - g_bar/diag(H)   (floored, diagonal -- NOT full H^{-1}).
+    So we fit the codebook by least squares to w_tilde instead of w. This is the
+    fix for the PPL blow-up: the previous version shifted the RHS by L^{-1} g_bar
+    (a FULL-inverse Newton step, un-floored), which exploded along small-eigenvalue
+    directions and dragged the deployed codebook off the true weights, while
+    update_P used the floored diagonal shift -- the two were inconsistent. Now
+    both use the identical floored diagonal target. g_over_diag=None -> vanilla.
     """
     device = torch.device("cuda")
     channel_size = W.shape[0]
@@ -169,30 +171,16 @@ def update_C_fo(
         L[i] = torch.linalg.cholesky(H[i])
     reduced_X = L.transpose(-2, -1)   # = L^T
 
-    # z_group = L^{-1} g_bar, per group, precomputed via triangular solve.
-    # g_bar is (out, in); rows share the group's L. Solve L z^T = g_bar^T.
-    z_all = None
-    if g_bar is not None:
-        z_all = torch.empty_like(W)   # (out, in), holds (L^{-1} g_bar) per row
-        for gi in range(num_groups):
-            r0, r1 = gi * group_size, (gi + 1) * group_size
-            rhs = g_bar[r0:r1].to(device).transpose(0, 1)          # (in, group_size)
-            zi = torch.linalg.solve_triangular(L[gi], rhs, upper=False)  # (in, group_size)
-            z_all[r0:r1] = zi.transpose(0, 1)
-        # DEBUG: the codebook RHS is shifted by L^{-1} g_bar (in the reduced/L^T
-        # space). This is NOT the same as the deployed-weight shift, but if it is
-        # huge it signals the codebook is being pulled to a wildly shifted target.
-        # Compare against ||L^T w|| (the un-shifted RHS) at same scale.
-        LTw = torch.empty_like(W)
-        for gi in range(num_groups):
-            r0, r1 = gi * group_size, (gi + 1) * group_size
-            LTw[r0:r1] = (reduced_X[gi] @ W[r0:r1].T).T
+    # shifted reconstruction target: same floored diagonal shift as update_P.
+    if g_over_diag is not None:
+        W_tilde = (W - g_over_diag.to(device))
         logging.info(
-            f"[lnqf-dbg] update_C: ||L^-1 g_bar||={z_all.norm().item():.3e} "
-            f"||L^T w||={LTw.norm().item():.3e} "
-            f"ratio={z_all.norm().item()/max(LTw.norm().item(),1e-30):.4f} "
-            f"(RHS shift as fraction of RHS)"
+            f"[lnqf-dbg] update_C: fitting codebook to shifted target "
+            f"||w_tilde - w||={g_over_diag.norm().item():.3e} "
+            f"({100.0*g_over_diag.norm().item()/max(W.norm().item(),1e-12):.3f}% of ||w||)"
         )
+    else:
+        W_tilde = W
 
     assert channel_size // sub_channel_size >= num_groups
     assert channel_size % (sub_channel_size * num_groups) == 0
@@ -211,18 +199,13 @@ def update_C_fo(
             X_batch = reduced_X_blk[st_idx_inp:end_idx_inp].to(device)   # (rows_in, in) slice of L^T
             P_batch = torch.nn.functional.one_hot(labels_batch.long(), num_classes=C.shape[-1]).float()
             A_batch_tmp = torch.einsum('bj,ijc->ibc', X_batch, P_batch)
-            b_batch_tmp = torch.einsum('bj,ij->ib', X_batch, W[st_idx:end_idx]).unsqueeze(-1)
+            # fit to the SHIFTED target w_tilde (identical target to update_P).
+            b_batch_tmp = torch.einsum('bj,ij->ib', X_batch, W_tilde[st_idx:end_idx]).unsqueeze(-1)
             A_batch_list.append(A_batch_tmp)
             b_batch_list.append(b_batch_tmp)
 
         A_batch = torch.cat(A_batch_list, dim=1)
-        b_batch = torch.cat(b_batch_list, dim=1)   # = L^T w
-
-        # ---- first-order shift of the RHS:  b <- b - L^{-1} g_bar ----
-        if z_all is not None:
-            # z_all rows are (L^{-1} g_bar); it lives in the same reduced space as b.
-            b_shift = z_all[st_idx:end_idx].to(device).unsqueeze(-1)   # (out_blk, in, 1)
-            b_batch = b_batch - b_shift
+        b_batch = torch.cat(b_batch_list, dim=1)   # = L^T w_tilde
 
         ######### REGULARIZATION (unchanged) #########
         lambda_reg = 1e-7
@@ -368,7 +351,7 @@ def train_least_squares_firstorder(
         phi_p, b2_p, lin_p = full_obj(labels, C)
         logging.info(f"Iter {iteration+1} (P): phi={phi_p:.4f} (B2={b2_p:.4f}, lin={lin_p:.4f})")
 
-        C = update_C_fo(W, H, labels, C, g_bar=g_bar_t)
+        C = update_C_fo(W, H, labels, C, g_over_diag=g_over_diag)
         phi_c, b2_c, lin_c = full_obj(labels, C)
         log_dict["objective"].append(phi_c); log_dict["iteration"].append(iteration + 1)
 
