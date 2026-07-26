@@ -352,6 +352,14 @@ def train_least_squares_firstorder(
     best_phi, best_b2, best_lin = full_obj(labels, C)
     best_labels, best_C = labels.clone(), C.clone()
     logging.info(f"Initial: phi={best_phi:.4f} (B2={best_b2:.4f}, lin={best_lin:.4f})")
+    if g_bar_t is not None:
+        # High-precision init check: lin should be SMALL-but-nonzero here, because
+        # the SqueezeLLM init quantizes for saliency k-means, which is ~orthogonal
+        # to g_bar -> g_bar^T(w_hat_init - w) ~ 0. A HARD zero would instead signal
+        # a bug (g_bar not applied / wrong shapes). LNQ-F then drives lin negative.
+        logging.info(f"[lnqf-dbg] init lin (hi-prec) = {best_lin:.3e}  "
+                     f"|lin|/B2 = {abs(best_lin)/max(best_b2,1e-30):.3e}  "
+                     f"(expected small: init is ~orthogonal to g_bar)")
 
     log_dict = {"objective": [best_phi], "iteration": [0], "lnqf_active": g_bar is not None}
 
