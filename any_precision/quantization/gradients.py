@@ -324,6 +324,24 @@ def get_gradients(
             # Save each layer's dictionary to l{layer_idx}.pt
             torch.save(layer_dict, filename)
 
+            # ----------------------------------------------------------------
+            # Effective sample size (Kish) per module/group, saved alongside the
+            # saliency. Required by the MP trust-region: saliency reweights tokens
+            # unevenly, so the MP aspect ratio must use n_eff = (sum s)^2 / sum(s^2),
+            # NOT n. We aggregate over the token axis (dims [N, seq] -> per group).
+            # Shape stored: { module_name -> tensor[num_groups] }.
+            neff_dict = {}
+            for module_name, cat_tensor in layer_dict.items():
+                if cat_tensor is None:
+                    neff_dict[module_name] = None
+                    continue
+                s = cat_tensor.float()                       # [N, seq, g]
+                s = s.reshape(-1, s.shape[-1])               # [N*seq, g]
+                num = s.sum(dim=0) ** 2                      # [g]
+                den = (s * s).sum(dim=0).clamp_min(1e-30)    # [g]
+                neff_dict[module_name] = (num / den).cpu()   # [g]
+            torch.save(neff_dict, os.path.join(saliency_path, f"l{layer_idx}_neff.pt"))
+
     # ----------------------------------------------------------------
     # 10) Save the gradients (if needed)
     # ----------------------------------------------------------------

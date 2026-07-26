@@ -25,6 +25,15 @@ if [[ -n "$MC_SAMPLES" ]]; then
   [[ -n "$MC_SEED" ]] && MC_OPT="$MC_OPT --mc_seed $MC_SEED"
 fi
 
+# MP trust-region (replaces damping in LNQ's train_least_squares). Enable with:
+#   MP_TR=1 [MP_NEFF=<n_eff> MP_KMAX=256] bash scripts/run_lnq.sh ...
+# MP_NEFF should come from measure_mp.py (§8). Consumed via env by layerwise_quantize.
+if [[ -n "$MP_TR" ]]; then
+  export AP_MP_TR="$MP_TR"
+  [[ -n "$MP_NEFF" ]] && export AP_MP_NEFF="$MP_NEFF"
+  [[ -n "$MP_KMAX" ]] && export AP_MP_KMAX="$MP_KMAX"
+fi
+
 python layerwise_nuq.py "$MODEL_PATH" \
   --model_name "$MODEL_REF" \
   --seed_precision "$BITS" \

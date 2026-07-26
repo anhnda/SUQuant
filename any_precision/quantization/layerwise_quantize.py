@@ -216,8 +216,20 @@ def train_least_squares(
     H: np.ndarray, # Shape: (num_groups, input_dim, input_dim)
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    mp_trust_region: bool = None,
+    mp_n_eff: float = None,
+    mp_k_max: int = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     device = torch.device("cuda")
+
+    # ---- MP trust-region config (default off -> original damping loop) ----
+    import os as _os
+    if mp_trust_region is None:
+        mp_trust_region = _os.environ.get("AP_MP_TR", "0") not in ("0", "", "false", "False")
+    if mp_n_eff is None and _os.environ.get("AP_MP_NEFF") is not None:
+        mp_n_eff = float(_os.environ["AP_MP_NEFF"])
+    if mp_k_max is None:
+        mp_k_max = int(_os.environ.get("AP_MP_KMAX", "256"))
 
     labels = torch.tensor(init_labels, dtype=torch.int8, device="cpu")
     C = torch.tensor(init_centroids, dtype=torch.float32, device="cpu")
@@ -225,22 +237,53 @@ def train_least_squares(
     H = torch.tensor(H, dtype=torch.float32).to(device)
 
     diag = torch.arange(H.shape[1], device=device)
-    for i in range(H.shape[0]):
-        avg_diag = torch.mean(torch.diag(H[i]))
-        damp, prev_damp = 1e-5, 0.
-        while True:
+    if mp_trust_region:
+        # ---- MP/BBP trust-region: denoise H in place of Tikhonov damping. ----
+        # Replaces the bottom eigenspace with an isotropic bulk floor (data-driven,
+        # scale-free) instead of a tuned damping constant, and keeps only BBP spikes.
+        # Result is PD by construction, so the Cholesky/update_C/update_P path below
+        # runs unchanged.
+        from .mp_trust_region import denoise_hessian, effective_sample_size
+        d_in = H.shape[1]
+        if mp_n_eff is not None:
+            n_eff = mp_n_eff
+        else:
+            # No token-level saliency here; fall back to a conservative proxy.
+            # n (calib tokens) is unknown at this call, so use env or a safe default.
+            n_eff = float(_os.environ.get("AP_MP_NEFF_FALLBACK", str(max(4 * d_in, 4096))))
+            logging.warning(
+                f"[MP-TR] n_eff not provided; using fallback n_eff={n_eff:.0f} "
+                f"(gamma_eff={d_in / n_eff:.3f}). For a correct MP threshold, pass "
+                f"AP_MP_NEFF measured from saliency (Kish n_eff)."
+            )
+        logging.info(f"[MP-TR] Denoising H via Marchenko-Pastur/BBP trust-region "
+                     f"(k_max={mp_k_max}); replacing damping loop.")
+        H = denoise_hessian(H, n_eff, k_max=mp_k_max, verbose=True)
+        # sanity: every group must now be PD for the downstream Cholesky.
+        for i in range(H.shape[0]):
             try:
                 torch.linalg.cholesky(H[i])
-                logging.info(f"{i+1}-th H is PD, dampening factor={prev_damp:.2e}")
-                break
-            except Exception as e:
-                print(e)
-                logging.info(f"{i+1}-th H is not PD, try dampening with factor={damp:.2e}")
-                H[i, diag, diag] += (damp - prev_damp) * avg_diag
-                prev_damp = damp
-                damp *= 10
-                if damp > 1e0:
-                    exit()
+            except Exception:
+                avg_diag = torch.mean(torch.diag(H[i]))
+                H[i, diag, diag] += 1e-6 * avg_diag
+                logging.warning(f"[MP-TR] group {i} needed tiny PD nudge post-denoise.")
+    else:
+        for i in range(H.shape[0]):
+            avg_diag = torch.mean(torch.diag(H[i]))
+            damp, prev_damp = 1e-5, 0.
+            while True:
+                try:
+                    torch.linalg.cholesky(H[i])
+                    logging.info(f"{i+1}-th H is PD, dampening factor={prev_damp:.2e}")
+                    break
+                except Exception as e:
+                    print(e)
+                    logging.info(f"{i+1}-th H is not PD, try dampening with factor={damp:.2e}")
+                    H[i, diag, diag] += (damp - prev_damp) * avg_diag
+                    prev_damp = damp
+                    damp *= 10
+                    if damp > 1e0:
+                        exit()
 
     best_obj_value = objective_function(W, H, labels, C).item()
     best_labels, best_C = labels.detach().cpu().clone(), C.detach().cpu().clone()
