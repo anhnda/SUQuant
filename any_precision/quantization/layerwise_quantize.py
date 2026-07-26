@@ -256,9 +256,11 @@ def train_least_squares(
                 f"(gamma_eff={d_in / n_eff:.3f}). For a correct MP threshold, pass "
                 f"AP_MP_NEFF measured from saliency (Kish n_eff)."
             )
-        logging.info(f"[MP-TR] Denoising H via Marchenko-Pastur/BBP trust-region "
-                     f"(k_max={mp_k_max}); replacing damping loop.")
-        H = denoise_hessian(H, n_eff, k_max=mp_k_max, verbose=True)
+        logging.info(f"[MP-TR] Denoising H via RMT trust-region "
+                     f"(mode={_os.environ.get('AP_MP_MODE', 'shrinkage')}, "
+                     f"k_max={mp_k_max}); replacing damping loop.")
+        _mp_mode = _os.environ.get("AP_MP_MODE", "shrinkage")
+        H = denoise_hessian(H, n_eff, k_max=mp_k_max, mode=_mp_mode, verbose=True)
         # sanity: every group must now be PD for the downstream Cholesky.
         for i in range(H.shape[0]):
             try:

@@ -126,6 +126,70 @@ def mp_edges(gamma_eff: float, sigma2: float):
     return lam_minus, lam_plus
 
 
+def nonlinear_shrinkage_eigs(evals: torch.Tensor, gamma_eff: float, sigma2: float):
+    """
+    Ledoit-Wolf-style nonlinear shrinkage of sample eigenvalues (whitened units).
+
+    For a continuous (non-spiked) spectrum there is no threshold to cut at; instead
+    every sample eigenvalue lambda is a biased estimate of the true one and must be
+    shrunk toward the bulk by an amount that depends on where it sits. The optimal
+    (minimum-Frobenius-loss) shrinkage replaces lambda_i by
+
+        d_i = lambda_i / |1 - gamma - gamma * lambda_i * m(lambda_i)|^2
+
+    where m(x) is the Stieltjes transform of the limiting sample spectral
+    distribution evaluated just above the real axis. Large, well-estimated
+    eigenvalues are barely touched; small, noise-dominated ones are pulled up
+    strongly toward the bulk -- which is exactly the "cut the noise without a hard
+    threshold" behaviour we want, and it collapses the 1/lambda_min blow-up that
+    makes H^{-1} noisy.
+
+    We estimate m(x) empirically from the sample eigenvalues themselves (the sample
+    spectral distribution is the empirical measure of {evals}), regularized off the
+    real axis by eta ~ sample spacing. This is the standard QuEST/analytical-NLShrink
+    approximation and needs no spike/threshold assumption.
+
+    Args:
+        evals:     sample eigenvalues (whitened), shape [d], >= 0.
+        gamma_eff: aspect ratio d / n_eff.
+        sigma2:    bulk level (whitened ~1); used only as a scale for the imaginary
+                   regularizer.
+    Returns:
+        shrunk eigenvalues, shape [d], all > 0.
+    """
+    lam = evals.double().clamp_min(0.0)
+    d = lam.numel()
+    gamma = min(max(gamma_eff, 1e-6), 0.999999)
+
+    # Imaginary regularizer: tie to the average eigenvalue gap so m(x) is smooth.
+    # eta larger -> smoother/more conservative shrinkage.
+    span = (lam.max() - lam.min()).clamp_min(1e-8)
+    eta = (span / max(d, 1)) * (d ** 0.5)          # ~ sqrt(d) * mean spacing
+    eta = eta.clamp_min(1e-6 * sigma2)
+
+    # Empirical Stieltjes transform of the sample spectrum at z = lam_i + i*eta:
+    #   m(z) = (1/d) sum_j 1 / (lam_j - z)
+    z_re = lam.unsqueeze(1)                          # [d,1]
+    diff_re = lam.unsqueeze(0) - z_re               # [d,d] real part (lam_j - lam_i)
+    denom = diff_re * diff_re + eta * eta           # |lam_j - z|^2
+    m_re = (diff_re / denom).mean(dim=1)            # Re m(z_i)
+    m_im = (eta / denom).mean(dim=1)                # Im m(z_i)  (> 0)
+
+    # d_i = lam_i / |1 - gamma - gamma*lam_i*m(z_i)|^2
+    a = 1.0 - gamma - gamma * lam * m_re            # real part of (1 - g - g*lam*m)
+    b = -gamma * lam * m_im                          # imag part
+    denom2 = (a * a + b * b).clamp_min(1e-12)
+    shrunk = lam / denom2
+
+    # Never let shrinkage push an eigenvalue below the bulk floor (keeps PD and
+    # avoids re-introducing tiny eigenvalues) nor above its original value.
+    shrunk = torch.clamp(shrunk, min=0.0)
+    shrunk = torch.minimum(shrunk, lam.clamp_min(0.0) + sigma2)  # mild upper guard
+    floor = sigma2 * (1.0 - gamma ** 0.5) ** 2 if gamma < 1.0 else sigma2 * 1e-2
+    shrunk = shrunk.clamp_min(max(floor, 1e-8))
+    return shrunk.to(evals.dtype)
+
+
 def _shrink_spike_eigs(lam_hat: torch.Tensor, gamma_eff: float, sigma2: float):
     """
     BBP eigenvalue de-biasing. A sampled spike eigenvalue lam_hat (whitened, in units
@@ -148,102 +212,102 @@ def denoise_hessian_group(
     H_g: torch.Tensor,
     gamma_eff: float,
     k_max: int = 256,
-    keep_diag_floor: bool = True,
+    mode: str = "shrinkage",
     verbose_tag: str = "",
 ):
     """
-    MP/BBP trust-region denoise of a single dxd PSD block.
+    RMT denoise of a single dxd PSD block. Two modes:
 
-    Steps:
-      1. whiten:  H_tilde = D^{-1/2} H D^{-1/2}
-      2. eig(H_tilde), estimate bulk sigma^2 (median), MP edge lambda_+
-      3. keep eigenvalues > lambda_+ as BBP spikes (signal); everything in/below the
-         bulk is noise
-      4. shrink kept eigenvalues via the BBP inverse map
-      5. rebuild:  H_tilde_mp = sigma^2 * I  +  sum_j (theta_j - sigma^2) v_j v_j^T
-         i.e. bottom/bulk directions are FLOORED at the bulk level sigma^2 (this is
-         the trust region: isotropic sigma^2 instead of arbitrary damping), and only
-         confident spikes rise above it with de-biased magnitudes.
-      6. map back:  H_mp = D^{1/2} H_tilde_mp D^{1/2}
+      mode="shrinkage" (DEFAULT, for continuous/non-spiked spectra):
+        Whiten, eig, then apply nonlinear (Ledoit-Wolf) shrinkage to EVERY
+        eigenvalue -- large ones barely move, small noise-dominated ones are pulled
+        up toward the bulk. No threshold, no rank cut. This is the right tool when
+        the spectrum has no clean bulk/spike gap (the measured LLM case): it removes
+        noise everywhere it lives (worst at the tail) and collapses the 1/lambda_min
+        blow-up, without discarding any direction.
 
-    Returns (H_mp, info_dict). H_mp is PD by construction (all eigenvalues >= sigma^2
-    * min(d-ratio,...) > 0), same shape/dtype/device as H_g.
+      mode="threshold" (BBP spike model, for spectra that DO separate):
+        Keep only eigenvalues above the MP edge lambda_+ as de-biased spikes, floor
+        the rest at the bulk sigma^2. Use only if measure_mp shows a clear gap.
+
+    Rebuild:  H_tilde_new = V diag(d_i) V^T   (shrinkage)  or  the spike surrogate,
+    then map back  H_new = D^{1/2} H_tilde_new D^{1/2}.
+
+    Returns (H_new, info). H_new is PD by construction, same shape/dtype/device.
     """
     d = H_g.shape[0]
     dtype_in, device = H_g.dtype, H_g.device
     Hf = H_g.double()
 
     H_tilde, d_sqrt = _whiten(Hf)
-
-    # Full symmetric eig on the whitened block. d ~ 2k-11k for Llama linear layers;
-    # eigh on a single dxd is fine on GPU. (Randomized top-k is a later optimization;
-    # correctness first, per the strategy doc's "measure before build".)
     evals, evecs = torch.linalg.eigh(H_tilde)          # ascending
     evals = evals.clamp_min(0.0)
+    cond_before = float((evals.max() / evals.clamp_min(1e-12).min()).item())
 
     sigma2 = _bulk_sigma2(evals, gamma_eff)
     lam_minus, lam_plus = mp_edges(gamma_eff, sigma2)
+    n_spike = int((evals > lam_plus).sum().item())
 
-    # BBP spikes: strictly above the bulk edge.
-    spike_mask = evals > lam_plus
-    n_spike = int(spike_mask.sum().item())
-
-    # Cap the number of kept directions (safety; spikes should be << d).
-    if n_spike > k_max:
-        # keep the largest k_max
-        idx_sorted = torch.argsort(evals, descending=True)[:k_max]
-        spike_mask = torch.zeros_like(spike_mask)
-        spike_mask[idx_sorted] = True
-        n_spike = k_max
-
-    theta = _shrink_spike_eigs(evals[spike_mask], gamma_eff, sigma2)  # de-biased
-    V = evecs[:, spike_mask]                                          # (d, k)
-
-    # Rebuild whitened surrogate: bulk floor sigma^2 * I + low-rank signal.
-    # H_tilde_mp = sigma^2 I + V diag(theta - sigma^2) V^T
-    delta = (theta - sigma2).clamp_min(0.0)
-    H_tilde_mp = torch.eye(d, dtype=torch.float64, device=device) * sigma2
-    if n_spike > 0:
-        H_tilde_mp = H_tilde_mp + (V * delta.unsqueeze(0)) @ V.transpose(-2, -1)
+    if mode == "threshold":
+        # --- BBP spike model: hard keep/discard (requires a spectral gap). ---
+        spike_mask = evals > lam_plus
+        k = int(spike_mask.sum().item())
+        if k > k_max:
+            idx_sorted = torch.argsort(evals, descending=True)[:k_max]
+            spike_mask = torch.zeros_like(spike_mask)
+            spike_mask[idx_sorted] = True
+            k = k_max
+        theta = _shrink_spike_eigs(evals[spike_mask], gamma_eff, sigma2)
+        V = evecs[:, spike_mask]
+        delta = (theta - sigma2).clamp_min(0.0)
+        H_tilde_new = torch.eye(d, dtype=torch.float64, device=device) * sigma2
+        if k > 0:
+            H_tilde_new = H_tilde_new + (V * delta.unsqueeze(0)) @ V.transpose(-2, -1)
+        new_eigs = torch.full((d,), sigma2, dtype=torch.float64, device=device)
+        new_eigs[-k:] = theta if k > 0 else new_eigs[-k:]
+    else:
+        # --- Nonlinear shrinkage: continuous shrink of the whole spectrum. ---
+        new_eigs = nonlinear_shrinkage_eigs(evals, gamma_eff, sigma2)
+        # Rebuild from the SAME eigenvectors with shrunk eigenvalues.
+        H_tilde_new = (evecs * new_eigs.unsqueeze(0)) @ evecs.transpose(-2, -1)
 
     # Map back through D^{1/2}.
-    H_mp = H_tilde_mp * d_sqrt.unsqueeze(0) * d_sqrt.unsqueeze(1)
-    H_mp = 0.5 * (H_mp + H_mp.transpose(-2, -1))
+    H_new = H_tilde_new * d_sqrt.unsqueeze(0) * d_sqrt.unsqueeze(1)
+    H_new = 0.5 * (H_new + H_new.transpose(-2, -1))
 
+    cond_after = float((new_eigs.max() / new_eigs.clamp_min(1e-12).min()).item())
     info = {
-        "d": d,
-        "gamma_eff": gamma_eff,
-        "sigma2": sigma2,
-        "lambda_plus": lam_plus,
-        "n_spike": n_spike,
-        "cond_before": float((evals.max() / evals.clamp_min(1e-12).min()).item()),
-        "cond_after": float(((sigma2 + delta.max() if n_spike > 0 else sigma2) / sigma2)),
+        "d": d, "gamma_eff": gamma_eff, "sigma2": sigma2, "lambda_plus": lam_plus,
+        "n_spike": n_spike, "mode": mode,
+        "cond_before": cond_before, "cond_after": cond_after,
     }
     if verbose_tag:
         logging.info(
-            f"[MP-TR {verbose_tag}] d={d} gamma_eff={gamma_eff:.4f} "
-            f"sigma^2={sigma2:.3e} lambda+={lam_plus:.3e} kept spikes={n_spike} "
-            f"cond {info['cond_before']:.2e} -> {info['cond_after']:.2e}"
+            f"[MP-TR {verbose_tag}] mode={mode} d={d} gamma_eff={gamma_eff:.4f} "
+            f"sigma^2={sigma2:.3e} spikes>{lam_plus:.2f}={n_spike} "
+            f"cond {cond_before:.2e} -> {cond_after:.2e}"
         )
-    return H_mp.to(dtype_in), info
+    return H_new.to(dtype_in), info
 
 
 def denoise_hessian(
     H: torch.Tensor,
     n_eff,
     k_max: int = 256,
+    mode: str = "shrinkage",
     verbose: bool = True,
 ):
     """
-    Apply MP/BBP denoise to every group block of H (num_groups, d, d).
+    Apply RMT denoise to every group block of H (num_groups, d, d).
 
     Args:
       H:      (num_groups, d, d) saliency-weighted Hessian on GPU.
       n_eff:  effective sample size. Either a scalar (shared) or a per-group list/
               tensor of length num_groups. gamma_eff = d / n_eff per group.
-      k_max:  cap on kept eigen-directions per group.
+      k_max:  cap on kept eigen-directions per group (threshold mode only).
+      mode:   "shrinkage" (default, continuous) or "threshold" (BBP spike).
     Returns:
-      H_mp:   denoised, well-conditioned PD Hessian, same shape as H.
+      H_new:  denoised, well-conditioned PD Hessian, same shape as H.
     """
     num_groups, d, _ = H.shape
     if not torch.is_tensor(n_eff):
@@ -259,7 +323,7 @@ def denoise_hessian(
         ne = max(n_eff_list[i], 1.0)
         gamma_eff = d / ne
         out[i], _ = denoise_hessian_group(
-            H[i], gamma_eff, k_max=k_max,
+            H[i], gamma_eff, k_max=k_max, mode=mode,
             verbose_tag=(f"g{i}" if verbose else ""),
         )
     return out
