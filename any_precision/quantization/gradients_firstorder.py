@@ -88,6 +88,11 @@ def get_firstorder(
         {name: None for name in analyzer.get_modules(layer).keys()}
         for layer in layers
     ]
+    # DEBUG accumulator: sum_i |grad_i| outer |x_i| (no sign cancellation).
+    acc_abs = [
+        {name: None for name in analyzer.get_modules(layer).keys()}
+        for layer in layers
+    ]
     counts = [0]  # number of (token) rows accumulated, shared across modules
 
     fwd_hooks, grad_hooks_state = [], {}
@@ -109,10 +114,17 @@ def get_firstorder(
                 # too would double-count and inflate g_bar by 1e3 (blow-up bug).
                 g2 = grad_out.reshape(-1, out_f).float()               # [Nrows, out]
                 x2 = x_local.reshape(-1, in_f).float()                   # [Nrows, in]
-                # sum_i grad_i outer x_i  ->  [out, in]
+                # sum_i grad_i outer x_i  ->  [out, in]   (SIGNED -> cancels)
                 contrib = g2.transpose(0, 1) @ x2
                 a = acc[li][name]
                 acc[li][name] = contrib if a is None else a + contrib
+                # DEBUG: sum |grad_i| outer |x_i|  (NO cancellation). The ratio
+                # ||signed|| / ||abs|| tells us whether the token gradients cancel
+                # (converged model => ratio << 1) or not (ratio ~ 1 => g_bar is
+                # dominated by non-cancelling magnitude, i.e. NOT ~0).
+                contrib_abs = g2.abs().transpose(0, 1) @ x2.abs()
+                aa = acc_abs[li][name]
+                acc_abs[li][name] = contrib_abs if aa is None else aa + contrib_abs
             out.register_hook(grad_hook)
         return forward_hook
 
@@ -142,7 +154,22 @@ def get_firstorder(
         layer_dict = {}
         for name in analyzer.get_modules(layer).keys():
             a = acc[li][name]
-            layer_dict[name] = None if a is None else (a * inv_n).cpu()
+            if a is None:
+                layer_dict[name] = None
+                continue
+            gbar = a * inv_n
+            layer_dict[name] = gbar.cpu()
+            # DEBUG: cancellation ratio ||signed|| / ||abs||. Near 0 => token
+            # gradients cancel (converged, g_bar ~ 0). Near 1 => no cancellation
+            # (g_bar dominated by magnitude, genuinely NOT small).
+            aa = acc_abs[li][name]
+            gabs = aa * inv_n
+            r = (gbar.norm() / gabs.norm().clamp_min(1e-30)).item()
+            logging.info(
+                f"[lnqf-dbg] L{li} {name}: ||g_bar||={gbar.norm().item():.3e} "
+                f"||g_abs||={gabs.norm().item():.3e} cancel_ratio={r:.4f} "
+                f"max|g_bar|={gbar.abs().max().item():.3e}"
+            )
         out_file = os.path.join(gbar_path, f"l{li}.pt")
         torch.save(layer_dict, out_file)
         logging.info(f"[lnqf] saved first-order term -> {out_file}")

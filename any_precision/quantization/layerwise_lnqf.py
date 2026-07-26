@@ -275,6 +275,15 @@ def train_least_squares_firstorder(
         shift_cap = float(max_shift) if max_shift and max_shift > 0 else 0.10
         rms_shift = g_over_diag.pow(2).mean().sqrt().item()
         rms_w = W.pow(2).mean().sqrt().item()
+        # DEBUG decomposition: is the big shift from g_bar being large, or from
+        # dividing by a small diag(H)? Report all three RMS magnitudes.
+        diagH_all = torch.cat([H[gi, torch.arange(d), torch.arange(d)] for gi in range(num_groups)])
+        logging.info(
+            f"[lnqf-dbg] RMS(g_bar)={g_bar_t.pow(2).mean().sqrt().item():.3e} "
+            f"RMS(diagH)={diagH_all.pow(2).mean().sqrt().item():.3e} "
+            f"RMS(w)={rms_w:.3e} RMS(g_bar/diagH)={rms_shift:.3e} "
+            f"ratio_shift/w={rms_shift/max(rms_w,1e-30):.3f}"
+        )
         gamma = 1.0
         if rms_shift > shift_cap * rms_w and rms_shift > 0:
             gamma = shift_cap * rms_w / rms_shift
