@@ -317,17 +317,22 @@ def train_least_squares_firstorder(
                 if damp > 1e0:
                     exit()
 
-    # NOTE: objective_function measures pure B2 (delta_w^T H delta_w); with the
-    # first-order term the true objective is phi = B2 + g_bar^T delta_w. We log
-    # the B2 part for comparability with vanilla LNQ, plus the linear part.
-    def full_obj(labels_, C_):
+    # Evaluate the three error curves on a given (labels, C), ALWAYS reporting
+    # all three even when the solver itself ignores g_bar (so we can score a
+    # vanilla-LNQ solution against the first-order term for comparison):
+    #   B2  = 1/2 (w_hat-w)^T H (w_hat-w)   pure second-order (output error)
+    #   lin = g_bar^T (w_hat - w)           pure first-order
+    #   phi = B2 + lin                      the full objective
+    def eval_three(labels_, C_):
         b2 = objective_function(W, H, labels_, C_).item()
         if g_bar_t is None:
             return b2, b2, 0.0
         Wq = torch.gather(C_.to(device).unsqueeze(1).expand(-1, W.shape[1], -1),
                           2, labels_.to(device).long().unsqueeze(-1)).squeeze(-1)
-        lin = (g_bar_t * (Wq - W)).sum().item() / W.shape[0]  # mean over rows, matches B2 scale
+        lin = (g_bar_t * (Wq - W)).sum().item() / W.shape[0]  # mean over rows -> B2 scale
         return b2 + lin, b2, lin
+
+    full_obj = eval_three  # backward-compatible alias
 
     best_phi, best_b2, best_lin = full_obj(labels, C)
     best_labels, best_C = labels.clone(), C.clone()
@@ -357,6 +362,33 @@ def train_least_squares_firstorder(
             break
 
         logging.info(f"Iter {iteration+1}/{num_iterations} done in {time.time()-t0:.2f}s")
+
+    # ----- head-to-head comparison against vanilla LNQ (no first-order term) -----
+    # Run plain LNQ on the SAME W/H/init, then score BOTH solutions with all three
+    # error curves, so we can see exactly what B1 traded: how much extra B2 (output
+    # error) it accepted in exchange for how much lin / phi it removed.
+    if g_bar_t is not None:
+        from .layerwise_quantize import train_least_squares
+        v_labels, v_C, _ = train_least_squares(
+            W.detach().cpu().numpy(), init_labels, init_centroids,
+            H.detach().cpu().numpy(),
+            num_iterations=num_iterations, cd_cycles=cd_cycles,
+        )
+        v_labels_t = torch.tensor(v_labels, dtype=torch.long)
+        v_C_t = torch.tensor(v_C, dtype=torch.float32)
+        v_phi, v_b2, v_lin = eval_three(v_labels_t, v_C_t)
+        f_phi, f_b2, f_lin = eval_three(best_labels, best_C)
+        logging.info("========== LNQ-F vs vanilla LNQ (same H,W,init) ==========")
+        logging.info(f"  vanilla LNQ : phi={v_phi:.5f}  B2={v_b2:.5f}  lin={v_lin:.5f}")
+        logging.info(f"  LNQ-F (B1+B2): phi={f_phi:.5f}  B2={f_b2:.5f}  lin={f_lin:.5f}")
+        logging.info(f"  delta        : phi={f_phi-v_phi:+.5f}  "
+                     f"B2={f_b2-v_b2:+.5f} (B1 paid this in output error)  "
+                     f"lin={f_lin-v_lin:+.5f} (B1 removed this in loss-aligned error)")
+        logging.info(f"  => B1 traded B2 {f_b2-v_b2:+.5f} for phi {f_phi-v_phi:+.5f}. "
+                     f"Net phi {'BETTER' if f_phi<v_phi else 'WORSE'} than vanilla.")
+        logging.info("==========================================================")
+        log_dict["vanilla_lnq"] = {"phi": v_phi, "b2": v_b2, "lin": v_lin}
+        log_dict["lnqf"] = {"phi": f_phi, "b2": f_b2, "lin": f_lin}
 
     labels = best_labels.detach().cpu().numpy().astype(np.float32)
     C = best_C.detach().cpu().numpy().astype(np.float32)
