@@ -117,12 +117,37 @@ def get_gradients(
     # ----------------------------------------------------------------
     # 1) Possibly load from cache (gradients only)
     # ----------------------------------------------------------------
-    if save_path is not None and os.path.isfile(save_path):
+    # The early-out below must NOT fire when saliency is requested but not yet
+    # complete on disk. The weight-gradient cache (save_path) is estimator-
+    # AGNOSTIC (no _mc suffix), so a stale Fisher gradient file would otherwise
+    # short-circuit an MC run and silently skip saliency generation entirely.
+    # Only skip work when the gradient cache exists AND either no saliency was
+    # asked for, or every saliency file already exists.
+    def _saliency_complete():
+        if saliency_path is None:
+            return True
+        layer_ids = list(analyzer.get_layers())
+        n_layers = len(layer_ids)
+        if sub_saliency is not None:
+            s, e = sub_saliency
+            needed = range(s, e)
+        else:
+            needed = range(n_layers)
+        return all(os.path.isfile(os.path.join(saliency_path, f"l{i}.pt"))
+                   for i in needed)
+
+    if save_path is not None and os.path.isfile(save_path) and _saliency_complete():
         logging.info(f"Gradients already calculated and saved at {save_path}.")
+        if saliency_path is not None:
+            logging.info(f"Saliency cache also present at {saliency_path}.")
         logging.info(f"Loading cached gradients...")
         return torch.load(save_path)
 
-    logging.info(f"Calculating gradients on {len(input_tokens)} tokens...")
+    if save_path is not None and os.path.isfile(save_path) and saliency_path is not None:
+        logging.info(f"Weight-gradient cache exists at {save_path}, but saliency "
+                     f"cache {saliency_path} is incomplete -> running the pass to "
+                     f"generate saliency (estimator: "
+                     f"{'MC' if os.environ.get('AP_MC_FISHER','0') not in ('0','','false','False') else 'set below'}).")
 
     # ----------------------------------------------------------------
     # 2) Prepare model
@@ -283,8 +308,7 @@ def get_gradients(
             filename = os.path.join(saliency_path, f"l{layer_idx}.pt")
 
             if os.path.exists(filename):
-                input(f"[WARNING] File {filename} already exists. "
-                      "Press Enter to overwrite or Ctrl+C to cancel.")
+                logging.warning(f"[saliency] {filename} already exists; overwriting.")
 
             # Save each layer's dictionary to l{layer_idx}.pt
             torch.save(layer_dict, filename)
@@ -292,15 +316,22 @@ def get_gradients(
     # ----------------------------------------------------------------
     # 10) Save the gradients (if needed)
     # ----------------------------------------------------------------
-    if save_path is not None and not skip_save_gradients:
+    # In MC mode the harvested weight.grad comes from pseudo-labels and is NOT the
+    # quantity anyone caches; more importantly save_path is estimator-agnostic
+    # (no _mc suffix), so writing here would CLOBBER the Fisher weight-gradient
+    # cache. Only the (suffixed) saliency files are the MC deliverable, so skip
+    # the weight-gradient write entirely under MC.
+    if save_path is not None and not skip_save_gradients and not mc_fisher:
         logging.info(f"Saving gradients to {save_path}...")
         if not save_path.endswith('.pt'):
             save_path = save_path + '.pt'
         if os.path.exists(save_path):
-            input(f"[WARNING] File {save_path} already exists. "
-                  "Press Enter to overwrite or Ctrl+C to cancel.")
+            logging.warning(f"[gradients] {save_path} already exists; overwriting.")
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(gradients, save_path)
+    elif mc_fisher:
+        logging.info("[hessian-estimator] MC mode: weight-gradient cache left "
+                     "untouched (only saliency files were written).")
 
     # ----------------------------------------------------------------
     # 11) Return the gradients
