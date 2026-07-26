@@ -44,6 +44,15 @@ if __name__ == "__main__":
                     help="Stable short name for cache paths (defaults to basename of model path)")
     parser.add_argument("--solver", type=str, default="lnq",
                         choices=["lnq", "lnqf", "flexnu", "lnqflexnu", "lnqbopt"])
+    # --- Hessian estimator (default: true-label empirical Fisher) ---
+    parser.add_argument("--mc_fisher", type=str2bool, default=False,
+                        help="Use Monte-Carlo GGN/Fisher (pseudo-label) instead of "
+                             "true-label empirical Fisher. Writes to a separate "
+                             "_mc<K> cache so both can be compared.")
+    parser.add_argument("--mc_samples", type=int, default=1,
+                        help="Number of pseudo-label draws K to average (MC only).")
+    parser.add_argument("--mc_seed", type=int, default=None,
+                        help="RNG seed for reproducible pseudo-label sampling (MC only).")
     # --- LNQ-F (first-order term) knobs (only used when --solver lnqf) ---
     parser.add_argument("--lnqf_mu", type=float, default=1.0,
                         help="Damping on the Newton target shift. Large mu -> "

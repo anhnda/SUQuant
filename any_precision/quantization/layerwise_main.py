@@ -41,12 +41,26 @@ def layerwise_nuq(
         model_name=None,
         solver="lnq",
         flexnu_kwargs=None,
+        mc_fisher=None,
+        mc_samples=None,
+        mc_seed=None,
 ):
 
     # ------------------- Set cache paths -------------------
 
     model_string = model if isinstance(model, str) else model.name_or_path
     model_name = model_name or model_string.split("/")[-1]
+
+    # Resolve Hessian estimator (arg or env). MC and true-label caches are kept
+    # separate via an _mc<K> suffix so a run of one never reads the other's cache.
+    if mc_fisher is None:
+        mc_fisher = os.environ.get("AP_MC_FISHER", "0") not in ("0", "", "false", "False")
+    if mc_samples is None:
+        mc_samples = int(os.environ.get("AP_MC_SAMPLES", "1"))
+    if mc_seed is None and os.environ.get("AP_MC_SEED") is not None:
+        mc_seed = int(os.environ["AP_MC_SEED"])
+    mc_samples = max(1, int(mc_samples))
+    _mc_suffix = (f"_mc{mc_samples}" if mc_fisher else "")
     initialization_cache_path = (f"{cache_dir}/quantized/"
                           f"{model_name}-w{seed_precision}_orig{seed_precision}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}")
@@ -56,22 +70,22 @@ def layerwise_nuq(
 
     saliency_cache_path = (f"{cache_dir}/saliency/"
                           f"{model_name}"
-                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}")
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{_mc_suffix}")
 
     hessians_cache_path = (f"{cache_dir}/hessians/"
                           f"{model_name}"
-                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{'_nosal' if is_nosal else ''}")
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{'_nosal' if is_nosal else ''}{_mc_suffix}")
 
     _slv = "" if solver == "lnq" else f"_{solver}"
     quantized_cache_path = (f"{cache_dir}/layerwise_quantized/"
                           f"{model_name}-w{seed_precision}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}"
                           f"_iter{num_iterations}_cd{cd_cycles}"
-                          f"{'_nosal' if is_nosal else ''}{_slv}")
+                          f"{'_nosal' if is_nosal else ''}{_slv}{_mc_suffix}")
     
     model_output_path = (f"{cache_dir}/layerwise_packed/"
                          f"layerwise-{model_name}-w{seed_precision}"
-                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}{_slv}")
+                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}{_slv}{_mc_suffix}")
 
 
     # Logging with time sans date, level name, and message

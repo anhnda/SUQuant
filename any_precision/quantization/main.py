@@ -33,6 +33,9 @@ def any_precision_quantize(
         sub_saliency=None,
         skip_save_gradients=False,
         model_name=None,
+        mc_fisher=None,
+        mc_samples=None,
+        mc_seed=None,
 ):
 
     # Logging with time sans date, level name, and message
@@ -51,6 +54,16 @@ def any_precision_quantize(
 
     assert mode in ['tokens', 'gradients', 'quantize', 'pack'], \
         "mode must be one of 'tokens', 'gradients', 'quantize', or 'pack'. Use 'pack' to run the entire pipeline."
+
+    # Resolve Hessian-estimator mode here (arg or env), so the saliency cache path
+    # can be made estimator-specific and the two never clobber each other.
+    if mc_fisher is None:
+        mc_fisher = os.environ.get("AP_MC_FISHER", "0") not in ("0", "", "false", "False")
+    if mc_samples is None:
+        mc_samples = int(os.environ.get("AP_MC_SAMPLES", "1"))
+    if mc_seed is None and os.environ.get("AP_MC_SEED") is not None:
+        mc_seed = int(os.environ["AP_MC_SEED"])
+    mc_samples = max(1, int(mc_samples))
 
     if overwrite_tokens:
         if not overwrite_gradients:
@@ -97,8 +110,10 @@ def any_precision_quantize(
                             f"{model_name}-{dataset}_s{num_examples}_blk{seq_len}.pt")
     
     if num_groups is not None:
+        _mc_suffix = (f"_mc{mc_samples}" if mc_fisher else "")
         saliency_cache_path = (f"{cache_dir}/saliency/"
-                            f"{model_name}-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}")
+                            f"{model_name}-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}"
+                            f"{_mc_suffix}")
     else:
         saliency_cache_path = None
 
@@ -145,6 +160,9 @@ def any_precision_quantize(
         num_groups=num_groups,
         sub_saliency=sub_saliency,
         skip_save_gradients=skip_save_gradients,
+        mc_fisher=mc_fisher,
+        mc_samples=mc_samples,
+        mc_seed=mc_seed,
     )
     
     logging.info("Gradient calculation complete.")

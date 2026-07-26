@@ -1,10 +1,55 @@
 import os
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 import logging
 from typing import Optional, Tuple
 from .config import *
 from any_precision.analyzer import dispatch_model
+
+
+def _mc_fisher_loss(logits, mc_samples: int, generator: Optional[torch.Generator] = None):
+    """
+    Monte-Carlo GGN/Fisher pseudo-loss for one sequence.
+
+    Instead of the true-label cross-entropy (which yields the *empirical* Fisher,
+    anchored to the calibration labels), we draw pseudo-labels from the model's own
+    predictive distribution  y~ ~ softmax(logits)  and return the mean-over-tokens
+    negative log-likelihood of those samples. The backward of this loss produces
+    output-gradients delta = p - onehot(y~) whose outer product is an unbiased
+    estimator of the per-logit Hessian  C_t = diag(p_t) - p_t p_t^T  (the GGN),
+    matching the predictive distribution rather than the observed label.
+
+    Scale note: HuggingFace's outputs.loss is a MEAN over valid tokens. To keep the
+    resulting saliency H on the SAME scale as the true-label path (so the downstream
+    1e3/1e6 conventions and LNQ damping are unchanged), this loss is ALSO a mean over
+    tokens. Averaging over mc_samples draws reduces the single-sample variance without
+    changing the scale (it stays a mean, not a sum).
+
+    Args:
+        logits:     [1, seq, vocab] model logits (float upcast done internally).
+        mc_samples: number of pseudo-label draws K to average over (K>=1).
+        generator:  optional torch.Generator for reproducible sampling.
+    Returns:
+        scalar loss tensor with grad flowing back into `logits`.
+    """
+    # logits: [1, seq, vocab] -> flatten tokens
+    flat = logits.reshape(-1, logits.shape[-1])                 # [T, V]
+    logp = F.log_softmax(flat.float(), dim=-1)                  # [T, V]
+    probs = logp.exp()                                          # [T, V], = softmax
+    T = flat.shape[0]
+
+    # Draw K pseudo-labels per token from p_t and average their NLL. Sampling is
+    # done under no_grad (it must not be differentiated); grad flows only through
+    # the gathered log-probs of the sampled classes.
+    with torch.no_grad():
+        # multinomial over [T, V]; num_samples=K gives [T, K]
+        y_tilde = torch.multinomial(probs, num_samples=mc_samples,
+                                     replacement=True, generator=generator)  # [T, K]
+
+    # gather log p_t[y~] for each draw, mean over tokens and over K draws
+    nll = -logp.gather(dim=-1, index=y_tilde)                   # [T, K]
+    return nll.mean()
 
 
 def get_gradients(
@@ -15,6 +60,9 @@ def get_gradients(
         num_groups: Optional[int] = None,
         sub_saliency: Optional[Tuple[int, int]] = None,
         skip_save_gradients: bool = False,
+        mc_fisher: Optional[bool] = None,
+        mc_samples: Optional[int] = None,
+        mc_seed: Optional[int] = None,
 ):
     """
     Calculates weight gradients for the given input tokens. Optionally also calculates
@@ -41,6 +89,30 @@ def get_gradients(
     Returns:
         gradients (list of dict): The list of per-layer, per-module weight gradients.
     """
+
+    # ----------------------------------------------------------------
+    # 0) Resolve Hessian-estimator mode (default: true-label empirical Fisher)
+    # ----------------------------------------------------------------
+    # The estimator can be switched to Monte-Carlo GGN/Fisher (pseudo-labels drawn
+    # from the model's own predictive distribution) either via the explicit arg or,
+    # to avoid threading a flag through every entrypoint's argparse, via env vars:
+    #     AP_MC_FISHER=1        enable MC pseudo-label estimator
+    #     AP_MC_SAMPLES=<int>   number of pseudo-label draws K (default 1)
+    #     AP_MC_SEED=<int>      RNG seed for reproducible sampling (optional)
+    # Leaving all of these unset reproduces the original true-label path byte-for-byte.
+    if mc_fisher is None:
+        mc_fisher = os.environ.get("AP_MC_FISHER", "0") not in ("0", "", "false", "False")
+    if mc_samples is None:
+        mc_samples = int(os.environ.get("AP_MC_SAMPLES", "1"))
+    if mc_seed is None and os.environ.get("AP_MC_SEED") is not None:
+        mc_seed = int(os.environ["AP_MC_SEED"])
+    mc_samples = max(1, int(mc_samples))
+
+    if mc_fisher:
+        logging.info(f"[hessian-estimator] Monte-Carlo GGN/Fisher "
+                     f"(pseudo-label, K={mc_samples}, seed={mc_seed}).")
+    else:
+        logging.info("[hessian-estimator] true-label empirical Fisher (default).")
 
     # ----------------------------------------------------------------
     # 1) Possibly load from cache (gradients only)
@@ -139,10 +211,22 @@ def get_gradients(
     # ----------------------------------------------------------------
     # 5) Forward/backward pass over data
     # ----------------------------------------------------------------
+    # Optional reproducible RNG for MC pseudo-label sampling, placed on the model device.
+    mc_generator = None
+    if mc_fisher and mc_seed is not None:
+        mc_generator = torch.Generator(device=model.device)
+        mc_generator.manual_seed(int(mc_seed))
+
     for tokens in tqdm(input_tokens, desc="Calculating gradients"):
         tokens = tokens.to(model.device).unsqueeze(0)
-        outputs = model(input_ids=tokens, labels=tokens)
-        loss = outputs.loss
+        if mc_fisher:
+            # MC GGN/Fisher: no label needed; sample pseudo-labels from the model.
+            outputs = model(input_ids=tokens)
+            loss = _mc_fisher_loss(outputs.logits, mc_samples, generator=mc_generator)
+        else:
+            # Default: true-label empirical Fisher (HF mean-over-tokens CE).
+            outputs = model(input_ids=tokens, labels=tokens)
+            loss = outputs.loss
         loss.backward()
 
     # ----------------------------------------------------------------

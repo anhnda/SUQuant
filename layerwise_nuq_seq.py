@@ -54,6 +54,17 @@ def main():
                         "dirty: per-block backward (not implemented).")
     p.add_argument("--no_pack", action="store_true",
                    help="Stop after quantize; do not build the packed model.")
+    # --- Hessian estimator: default true-label empirical Fisher; --mc_fisher
+    #     switches to Monte-Carlo GGN/Fisher (pseudo-labels from the model). The
+    #     two estimators write to SEPARATE saliency caches so they never clobber
+    #     each other and can be compared directly. ---
+    p.add_argument("--mc_fisher", type=str2bool, default=False,
+                   help="Use Monte-Carlo GGN/Fisher (pseudo-label) instead of "
+                        "the default true-label empirical Fisher.")
+    p.add_argument("--mc_samples", type=int, default=1,
+                   help="Number of pseudo-label draws K to average (MC only).")
+    p.add_argument("--mc_seed", type=int, default=None,
+                   help="RNG seed for reproducible pseudo-label sampling (MC only).")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -67,8 +78,12 @@ def main():
 
     tokens_cache = (f"{cd}/tokens/"
                     f"{model_name}-{args.dataset}_s{args.num_examples}_blk{args.seq_len}.pt")
+    # MC and true-label estimators must not share a saliency cache, or a stale
+    # cache from one would be silently reused by the other and wreck the A/B.
+    _mc_suffix = (f"_mc{args.mc_samples}" if args.mc_fisher else "")
     saliency_cache = (f"{cd}/saliency/{model_name}"
-                      f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}_g{args.num_groups}")
+                      f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}_g{args.num_groups}"
+                      f"{_mc_suffix}")
     init_cache = (f"{cd}/quantized/"
                   f"{model_name}-w{args.seed_precision}_orig{args.seed_precision}"
                   f"-{args.dataset}_s{args.num_examples}_blk{args.seq_len}")
@@ -102,6 +117,8 @@ def main():
                 analyzer, tokens,
                 save_path=None, saliency_path=saliency_cache,
                 num_groups=args.num_groups, skip_save_gradients=True,
+                mc_fisher=args.mc_fisher, mc_samples=args.mc_samples,
+                mc_seed=args.mc_seed,
             )
             # reload analyzer: gradient pass may have moved/hooked the model
             analyzer = get_analyzer(args.model, yaml_path=args.yaml_path, include_tokenizer=True)
