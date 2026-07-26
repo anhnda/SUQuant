@@ -12,22 +12,24 @@
 #         Delta_l ~= 1/2 (w_hat - w)^T H (w_hat - w),           (B2)
 # dropping the first-order term  g_bar^T (w_hat - w)  under the "converged model
 # => mean gradient ~ 0" assumption. On a small, distribution-shifted calibration
-# set that assumption is only approximate, and the residual first-order term is
-# the part end-to-end fine-tuning is later seen to recover.
+# set that residual is real (most LLM tokens are not saturated => d l/d z != 0),
+# and it is what end-to-end fine-tuning is later seen to recover.
 #
 # LNQ-F keeps it:
 #         Delta_l ~= g_bar^T(w_hat - w) + 1/2 (w_hat - w)^T H (w_hat - w).  (B1+B2)
-# Completing the square, this is the SAME B2 objective with the reconstruction
-# target moved by one (damped) Newton step:
-#         w_tilde = w - (H + mu*avg_diag(H)*I)^{-1} g_bar.
-# The LNQ solver (Cholesky, closed-form codebook Eq. 9, cyclic-CD assignment,
-# Prop. 4.1 descent guarantee) runs UNCHANGED on w_tilde. Only the target moves.
 #
-# mu is a continuous knob:
-#   MU large (e.g. 1e3)  -> w_tilde -> w        -> reproduces plain LNQ (B2).
-#   MU small (e.g. 1e-1) -> full Newton step    -> strongest B1 correction.
-# Start large and decrease; MAX_SHIFT is a trust-region cap on ||w_tilde - w||
-# per row so a noisy g_bar cannot drag a row out of the region where B2 is valid.
+# IMPLEMENTATION (option A -- NO global H^{-1})
+# ---------------------------------------------
+# The first-order term is folded DIRECTLY into LNQ's two closed-form updates,
+# not via a Newton target shift w - H^{-1} g_bar (which would invert the
+# ill-conditioned full H and blow up -- the earlier prototype's failure mode):
+#   * codebook (given P):  c = (P^T H P)^{-1} (P^T H w - P^T g_bar)
+#                          -- same small (m x m) inverse as vanilla LNQ; the RHS
+#                          shift is one triangular solve with the existing L.
+#   * assignment (given c): CD round target becomes  w_i - g_bar_i/H_ii - B_i
+#                          -- division by the SCALAR diagonal H_ii, no inverse.
+# Both remain exact minimizers along their block/coordinate, so LNQ's Prop. 4.1
+# monotone-descent + convergence guarantee carries over unchanged.
 #
 # PREREQUISITES (identical to the other solvers, PLUS one extra pass)
 # -------------------------------------------------------------------
@@ -37,12 +39,20 @@
 # saliency pass does NOT produce (it stores (d l/d z)^2, sign discarded). This
 # script builds it automatically via firstorder_cache.py before quantizing.
 #
-# SANITY CHECK (do this first): run with MU=1e6. LNQ-F must then reproduce the
-# plain run_lnq.sh perplexity to within noise. If it does not, the first-order
-# path is wired wrong -- fix that before trusting any MU<inf number.
+# SANITY CHECK (do this first): run with SKIP_FIRSTORDER=1 after deleting the
+# first-order cache, OR compare against run_lnq.sh directly. With g_bar absent
+# LNQ-F reduces bit-for-bit to vanilla LNQ, so the two objectives/perplexity
+# must match. Only once that holds should you trust the g_bar-on numbers.
+#
+# The B1+B2 objective is logged per iteration as  phi = B2 + lin, so you can
+# watch the linear term's contribution directly.
+#
+# NOTE: MU / MAX_SHIFT are accepted for CLI compatibility but are UNUSED in
+# option A (there is no Newton step to damp). They are kept only so old command
+# lines do not break.
 #
 # Env overrides: DATASET, SEQ_LEN, NUM_EXAMPLES, NUM_ITER, CD_CYCLES,
-#                MU, MAX_SHIFT, SKIP_FIRSTORDER
+#                SKIP_FIRSTORDER  (MU, MAX_SHIFT accepted but ignored)
 # ---------------------------------------------------------------------------
 set -x
 
@@ -69,9 +79,9 @@ NUM_ITER=${NUM_ITER:-3}
 CD_CYCLES=${CD_CYCLES:-4}
 
 # ---- first-order (B1) knobs -------------------------------------------------
-# MU large => plain LNQ; MU small => full first-order correction. Sweep it.
-MU=${MU:-1.0}
-# Per-row L2 trust-region cap on the target shift. 0 disables (full step).
+# option A folds g_bar directly into update_P/update_C; there is no Newton step,
+# so MU and MAX_SHIFT are UNUSED (kept only for CLI back-compat).
+MU=${MU:-0.0}
 MAX_SHIFT=${MAX_SHIFT:-0.0}
 # Set SKIP_FIRSTORDER=1 to reuse an existing first-order cache without rebuilding.
 SKIP_FIRSTORDER=${SKIP_FIRSTORDER:-0}

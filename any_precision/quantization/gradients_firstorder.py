@@ -104,7 +104,10 @@ def get_firstorder(
                 x_local = grad_hooks_state.pop((li, name))
                 b, s, out_f = grad_out.shape
                 in_f = x_local.shape[-1]
-                g2 = grad_out.reshape(-1, out_f).float() * GRAD_SCALE   # [Nrows, out]
+                # raw signed gradient here; the full GBAR_SCALE (=1e6) factor is
+                # applied ONCE at normalization below. Scaling by GRAD_SCALE here
+                # too would double-count and inflate g_bar by 1e3 (blow-up bug).
+                g2 = grad_out.reshape(-1, out_f).float()               # [Nrows, out]
                 x2 = x_local.reshape(-1, in_f).float()                   # [Nrows, in]
                 # sum_i grad_i outer x_i  ->  [out, in]
                 contrib = g2.transpose(0, 1) @ x2
