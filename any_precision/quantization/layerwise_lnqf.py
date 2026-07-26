@@ -144,19 +144,22 @@ def update_C_fo(
     H: torch.Tensor,        # (g, in, in)
     labels: torch.Tensor,   # (out, in)
     C: torch.Tensor,        # (out, n_cluster)
-    g_over_diag: Optional[torch.Tensor] = None,  # (out, in) = g_bar/diag(H) FLOORED
+    g_bar: Optional[torch.Tensor] = None,  # (out, in) SIGNED first-order term (NOT floored)
 ):
     """
-    Closed-form codebook update, CONSISTENT with update_P_fo.
+    Closed-form codebook update = exact minimizer of phi over c (given P).
 
-    Both updates must aim the reconstruction at the SAME shifted target
-        w_tilde = w - g_bar/diag(H)   (floored, diagonal -- NOT full H^{-1}).
-    So we fit the codebook by least squares to w_tilde instead of w. This is the
-    fix for the PPL blow-up: the previous version shifted the RHS by L^{-1} g_bar
-    (a FULL-inverse Newton step, un-floored), which exploded along small-eigenvalue
-    directions and dragged the deployed codebook off the true weights, while
-    update_P used the floored diagonal shift -- the two were inconsistent. Now
-    both use the identical floored diagonal target. g_over_diag=None -> vanilla.
+    The coordinate-min of  phi = g^T u + 1/2 u^T H u  over the codebook, given the
+    assignment P, is
+        c = (P^T H P)^{-1} (P^T H w - P^T g_bar).                       (Eq.9 + B1)
+    Here P^T g_bar is just the per-codeword SUM of g_bar over the coordinates
+    assigned to that codeword -- NO inverse, NO diagonal, NO floor. This is the
+    "H^{-1} cancels" form we settled on originally: the only inverse is the same
+    (m x m) P^T H P that vanilla update_C already solves.
+
+    We build the normal equations explicitly (M = A^T A = P^T H P, with A = L^T P)
+    so we can subtract P^T g_bar from the RHS, then solve M c = rhs. g_bar=None
+    reproduces vanilla exactly.
     """
     device = torch.device("cuda")
     channel_size = W.shape[0]
@@ -165,22 +168,18 @@ def update_C_fo(
     sub_input_size = 2 ** 16
     num_groups = H.shape[0]
     group_size = W.shape[0] // num_groups
+    n_cluster = C.shape[-1]
 
     L = torch.empty_like(H)
     for i in range(num_groups):
         L[i] = torch.linalg.cholesky(H[i])
     reduced_X = L.transpose(-2, -1)   # = L^T
 
-    # shifted reconstruction target: same floored diagonal shift as update_P.
-    if g_over_diag is not None:
-        W_tilde = (W - g_over_diag.to(device))
-        logging.info(
-            f"[lnqf-dbg] update_C: fitting codebook to shifted target "
-            f"||w_tilde - w||={g_over_diag.norm().item():.3e} "
-            f"({100.0*g_over_diag.norm().item()/max(W.norm().item(),1e-12):.3f}% of ||w||)"
-        )
-    else:
-        W_tilde = W
+    if g_bar is not None:
+        g_bar = g_bar.to(device)
+        # DEBUG: report P^T g_bar magnitude vs P^T H w (RHS) magnitude, plus the
+        # implied codebook shift, so a blow-up in the linear RHS term is visible.
+        ptg_norm_acc = 0.0
 
     assert channel_size // sub_channel_size >= num_groups
     assert channel_size % (sub_channel_size * num_groups) == 0
@@ -193,38 +192,51 @@ def update_C_fo(
         end_idx = min(st_idx + sub_channel_size, channel_size)
 
         A_batch_list, b_batch_list = [], []
-        labels_batch = labels[st_idx:end_idx].to(device)
+        labels_batch = labels[st_idx:end_idx].to(device)          # (blk, in)
         for st_idx_inp in range(0, input_size, sub_input_size):
             end_idx_inp = min(st_idx_inp + sub_input_size, input_size)
-            X_batch = reduced_X_blk[st_idx_inp:end_idx_inp].to(device)   # (rows_in, in) slice of L^T
-            P_batch = torch.nn.functional.one_hot(labels_batch.long(), num_classes=C.shape[-1]).float()
+            X_batch = reduced_X_blk[st_idx_inp:end_idx_inp].to(device)   # slice of L^T
+            P_batch = torch.nn.functional.one_hot(labels_batch.long(), num_classes=n_cluster).float()
             A_batch_tmp = torch.einsum('bj,ijc->ibc', X_batch, P_batch)
-            # fit to the SHIFTED target w_tilde (identical target to update_P).
-            b_batch_tmp = torch.einsum('bj,ij->ib', X_batch, W_tilde[st_idx:end_idx]).unsqueeze(-1)
+            b_batch_tmp = torch.einsum('bj,ij->ib', X_batch, W[st_idx:end_idx]).unsqueeze(-1)
             A_batch_list.append(A_batch_tmp)
             b_batch_list.append(b_batch_tmp)
 
-        A_batch = torch.cat(A_batch_list, dim=1)
-        b_batch = torch.cat(b_batch_list, dim=1)   # = L^T w_tilde
+        A_batch = torch.cat(A_batch_list, dim=1)   # (blk, in, m)  = L^T P
+        b_batch = torch.cat(b_batch_list, dim=1)   # (blk, in, 1)  = L^T w
 
-        ######### REGULARIZATION (unchanged) #########
+        # ----- explicit normal equations: M c = rhs -----
+        #   M   = A^T A = P^T H P                       (blk, m, m)
+        #   rhs = A^T b = P^T H w                       (blk, m, 1)
+        M = torch.einsum('ibc,ibd->icd', A_batch, A_batch)
+        rhs = torch.einsum('ibc,ibd->icd', A_batch, b_batch)   # (blk, m, 1)
+
+        # ----- first-order term: subtract P^T g_bar from the RHS -----
+        #   (P^T g_bar)_q = sum_{coords assigned to q} g_bar   -- pure sum, no inverse.
+        if g_bar is not None:
+            g_blk = g_bar[st_idx:end_idx]                       # (blk, in)
+            Ptg = torch.zeros((g_blk.shape[0], n_cluster), device=device, dtype=g_blk.dtype)
+            Ptg.scatter_add_(1, labels_batch.long(), g_blk)     # (blk, m)
+            rhs = rhs - Ptg.unsqueeze(-1)
+            ptg_norm_acc += Ptg.pow(2).sum().item()
+
+        # Tikhonov on M (matches the lambda used by vanilla lstsq path).
         lambda_reg = 1e-7
-        batch_size, num_samples, n_cluster = A_batch.shape
-        dtype, device2 = A_batch.dtype, A_batch.device
-        sqrt_lambda = torch.sqrt(torch.tensor(lambda_reg, dtype=dtype, device=device2))
-        I = sqrt_lambda * torch.eye(n_cluster, dtype=dtype, device=device2).unsqueeze(0).expand(batch_size, -1, -1)
-        A_batch = torch.cat([A_batch.transpose(1, 2), I], dim=2).transpose(1, 2)
-        zeros = torch.zeros((batch_size, n_cluster, 1), dtype=dtype, device=device2)
-        b_batch = torch.cat([b_batch, zeros], dim=1)
-        ##############################################
+        M = M + lambda_reg * torch.eye(n_cluster, device=device, dtype=M.dtype).unsqueeze(0)
 
-        C_hat_batch = torch.linalg.lstsq(A_batch, b_batch).solution
+        C_hat_batch = torch.linalg.solve(M, rhs).squeeze(-1)    # (blk, m)
         if torch.isnan(C_hat_batch).any():
             logging.error(f"NaN in C_hat_batch for indices {st_idx}:{end_idx}")
             exit()
-        C_hat_list.append(C_hat_batch.squeeze(-1))
+        C_hat_list.append(C_hat_batch)
         pb.update(1)
     pb.close()
+
+    if g_bar is not None:
+        logging.info(
+            f"[lnqf-dbg] update_C: ||P^T g_bar||={ptg_norm_acc**0.5:.3e} "
+            f"(RHS linear-term magnitude; solved via explicit P^T H P, no inverse of H)"
+        )
 
     return torch.cat(C_hat_list, dim=0).cpu()
 
@@ -351,7 +363,7 @@ def train_least_squares_firstorder(
         phi_p, b2_p, lin_p = full_obj(labels, C)
         logging.info(f"Iter {iteration+1} (P): phi={phi_p:.4f} (B2={b2_p:.4f}, lin={lin_p:.4f})")
 
-        C = update_C_fo(W, H, labels, C, g_over_diag=g_over_diag)
+        C = update_C_fo(W, H, labels, C, g_bar=g_bar_t)
         phi_c, b2_c, lin_c = full_obj(labels, C)
         log_dict["objective"].append(phi_c); log_dict["iteration"].append(iteration + 1)
 
