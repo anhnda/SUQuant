@@ -263,6 +263,29 @@ def train_least_squares_firstorder(
             r0, r1 = gi * group_size, (gi + 1) * group_size
             diagH = H[gi, torch.arange(d), torch.arange(d)].clamp_min(1e-12)  # (in,)
             g_over_diag[r0:r1] = g_bar_t[r0:r1] / diagH.unsqueeze(0)
+
+        # SAFETY TRUST-REGION (applied at the SOURCE, to g_bar itself, so BOTH the
+        # assignment branch (uses g_bar/diag(H)) and the codebook branch (uses
+        # L^{-1} g_bar) shrink by the SAME factor and stay mutually consistent).
+        # Rationale: if g_bar is over-scaled or its gradient statistic is
+        # inconsistent with H's squared saliency, an unbounded diagonal shift drags
+        # the deployed w_hat off the true weights -> the model breaks while phi (the
+        # surrogate) still looks small. We require the RMS diagonal shift to be at
+        # most `shift_cap` * RMS(|w|); if it exceeds that, scale g_bar down globally.
+        shift_cap = float(max_shift) if max_shift and max_shift > 0 else 0.10
+        rms_shift = g_over_diag.pow(2).mean().sqrt().item()
+        rms_w = W.pow(2).mean().sqrt().item()
+        gamma = 1.0
+        if rms_shift > shift_cap * rms_w and rms_shift > 0:
+            gamma = shift_cap * rms_w / rms_shift
+            g_bar_t = g_bar_t * gamma
+            g_over_diag = g_over_diag * gamma
+        logging.info(
+            f"[lnqf] shift RMS={rms_shift:.3e} vs {shift_cap:.3g}*RMS(w)={shift_cap*rms_w:.3e} "
+            f"-> g_bar rescaled by gamma={gamma:.3e} "
+            f"(||shift||={g_over_diag.norm().item():.3e}, "
+            f"{100.0*g_over_diag.norm().item()/max(W.norm().item(),1e-12):.3f}% of ||w||)"
+        )
         logging.info("[lnqf] first-order term folded into update_P/update_C (option A, no global H^{-1}).")
     else:
         logging.warning("[lnqf] g_bar=None -> vanilla LNQ (second-order only).")
