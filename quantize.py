@@ -36,6 +36,17 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default=None,
                     help="Stable short name for cache paths "
                          "(defaults to basename of model path)")
+    # --- Hessian estimator (default: true-label empirical Fisher). This is the
+    #     entrypoint that actually GENERATES the saliency cache, so --mc_fisher
+    #     here decides which estimator every later step reads. ---
+    parser.add_argument("--mc_fisher", type=lambda v: str(v).lower() in ("1","true","t","y","yes"),
+                        default=False,
+                        help="Use Monte-Carlo GGN/Fisher (pseudo-label) instead of "
+                             "true-label empirical Fisher.")
+    parser.add_argument("--mc_samples", type=int, default=1,
+                        help="Number of pseudo-label draws K to average (MC only).")
+    parser.add_argument("--mc_seed", type=int, default=None,
+                        help="RNG seed for reproducible pseudo-label sampling (MC only).")
     args = parser.parse_args()
     args.sub_saliency = tuple(args.sub_saliency) if args.sub_saliency else None
 
