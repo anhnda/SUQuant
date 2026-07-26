@@ -278,11 +278,21 @@ def train_least_squares_firstorder(
         # DEBUG decomposition: is the big shift from g_bar being large, or from
         # dividing by a small diag(H)? Report all three RMS magnitudes.
         diagH_all = torch.cat([H[gi, torch.arange(d), torch.arange(d)] for gi in range(num_groups)])
+        # per-coordinate shift distribution: RMS hides the blow-up. Show min diagH
+        # and the tail of |shift|, since a handful of near-singular coords (H_ii~0)
+        # inflate RMS while the median stays sane.
+        shift_abs = g_over_diag.abs()
+        q = torch.tensor([0.5, 0.9, 0.99, 0.999, 1.0], device=g_over_diag.device)
+        shift_q = torch.quantile(shift_abs.flatten().float(), q).tolist()
         logging.info(
             f"[lnqf-dbg] RMS(g_bar)={g_bar_t.pow(2).mean().sqrt().item():.3e} "
-            f"RMS(diagH)={diagH_all.pow(2).mean().sqrt().item():.3e} "
-            f"RMS(w)={rms_w:.3e} RMS(g_bar/diagH)={rms_shift:.3e} "
-            f"ratio_shift/w={rms_shift/max(rms_w,1e-30):.3f}"
+            f"diagH[min={diagH_all.min().item():.3e} med={diagH_all.median().item():.3e} "
+            f"max={diagH_all.max().item():.3e}] RMS(w)={rms_w:.3e}"
+        )
+        logging.info(
+            f"[lnqf-dbg] |shift| quantiles [50%={shift_q[0]:.3e} 90%={shift_q[1]:.3e} "
+            f"99%={shift_q[2]:.3e} 99.9%={shift_q[3]:.3e} max={shift_q[4]:.3e}] "
+            f"| median shift/w = {shift_q[0]/max(rms_w,1e-30):.4f}"
         )
         gamma = 1.0
         if rms_shift > shift_cap * rms_w and rms_shift > 0:
