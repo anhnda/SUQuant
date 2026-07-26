@@ -12,6 +12,7 @@ import time
 from .utils import get_progress_bar
 from .layerwise_flexnu import train_flexnu
 from .layerwise_lnqflexnu import train_lnq_flexnu
+from .layerwise_lnqf import train_least_squares_firstorder
 @torch.no_grad()
 def objective_function(
     W: torch.Tensor, 
@@ -297,6 +298,35 @@ def free_and_log_memory():
     import gc; gc.collect()
     logging.info(f"Left memory: {torch.cuda.mem_get_info()[0] / (10 ** 9)} GB")
 
+def _load_firstorder_term(gbar_path, l, module_name, output_dim, input_dim):
+    """
+    Load the signed first-order term g_bar for one (layer, module).
+
+    Expected on disk: {gbar_path}/l{l}.pt  ->  {module_name: tensor[out, in]}.
+    Returns a float32 numpy array [output_dim, input_dim], or None if the cache
+    is missing / malformed (the solver then falls back to plain LNQ and logs it).
+    """
+    if gbar_path is None:
+        return None
+    file_path = os.path.join(gbar_path, f"l{l}.pt")
+    if not os.path.exists(file_path):
+        logging.warning(f"[lnqf] first-order cache {file_path} not found -> plain LNQ for this layer.")
+        return None
+    try:
+        layer_dict = torch.load(file_path)
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"[lnqf] failed to load {file_path} ({e}) -> plain LNQ for this layer.")
+        return None
+    if module_name not in layer_dict or layer_dict[module_name] is None:
+        logging.warning(f"[lnqf] module '{module_name}' missing in {file_path} -> plain LNQ for this module.")
+        return None
+    g = layer_dict[module_name]
+    if not isinstance(g, np.ndarray):
+        g = g.float().cpu().numpy()
+    g = g.astype(np.float32).reshape(output_dim, input_dim)
+    return g
+
+
 def seed_layer(
     l: int,
     module_names: List[str],
@@ -373,6 +403,24 @@ def seed_layer(
                 module_hessian,
                 num_iterations=num_iterations, cd_cycles=cd_cycles,
                 **_fk,
+            )
+        elif solver == "lnqf":
+            # LNQ with the first-order (linear) end-loss term retained.
+            # The signed first-order cache is optional: when absent, the solver
+            # degrades to plain LNQ and logs it. Knobs ride the passthrough dict.
+            bk = dict(flexnu_kwargs or {})
+            lnqf_mu = float(bk.get("lnqf_mu", 1.0))
+            lnqf_max_shift = float(bk.get("lnqf_max_shift", 0.0))
+            lnqf_gbar_path = bk.get("lnqf_gbar_path", None)
+
+            g_bar = _load_firstorder_term(
+                lnqf_gbar_path, l, module_name, output_dim, input_dim
+            )
+            labels, C, log_dict = train_least_squares_firstorder(
+                reshaped_module_weight, init_labels, init_centroids,
+                module_hessian,
+                num_iterations=num_iterations, cd_cycles=cd_cycles,
+                g_bar=g_bar, mu=lnqf_mu, max_shift=lnqf_max_shift,
             )
         elif solver == "flexnu":
             _fk = {k: v for k, v in (flexnu_kwargs or {}).items()

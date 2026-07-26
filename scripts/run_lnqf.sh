@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# LNQ-F : LNQ with the FIRST-ORDER (linear) end-loss term retained.
+#
+#   bash scripts/run_lnqf.sh <model_ref> <bits> <num_groups> [-m mode]
+#   bash scripts/run_lnqf.sh meta-llama/Llama-2-7b-hf 3 1
+#
+# WHAT IT DOES
+# ------------
+# Plain LNQ / GuidedQuant minimises only the SECOND-order term of the change in
+# end loss,
+#         Delta_l ~= 1/2 (w_hat - w)^T H (w_hat - w),           (B2)
+# dropping the first-order term  g_bar^T (w_hat - w)  under the "converged model
+# => mean gradient ~ 0" assumption. On a small, distribution-shifted calibration
+# set that assumption is only approximate, and the residual first-order term is
+# the part end-to-end fine-tuning is later seen to recover.
+#
+# LNQ-F keeps it:
+#         Delta_l ~= g_bar^T(w_hat - w) + 1/2 (w_hat - w)^T H (w_hat - w).  (B1+B2)
+# Completing the square, this is the SAME B2 objective with the reconstruction
+# target moved by one (damped) Newton step:
+#         w_tilde = w - (H + mu*avg_diag(H)*I)^{-1} g_bar.
+# The LNQ solver (Cholesky, closed-form codebook Eq. 9, cyclic-CD assignment,
+# Prop. 4.1 descent guarantee) runs UNCHANGED on w_tilde. Only the target moves.
+#
+# mu is a continuous knob:
+#   MU large (e.g. 1e3)  -> w_tilde -> w        -> reproduces plain LNQ (B2).
+#   MU small (e.g. 1e-1) -> full Newton step    -> strongest B1 correction.
+# Start large and decrease; MAX_SHIFT is a trust-region cap on ||w_tilde - w||
+# per row so a noisy g_bar cannot drag a row out of the region where B2 is valid.
+#
+# PREREQUISITES (identical to the other solvers, PLUS one extra pass)
+# -------------------------------------------------------------------
+#   bash scripts/run_sqllm.sh $MODEL $BITS $G           # init  -- REQUIRED
+#   bash scripts/run_lnq.sh   $MODEL $BITS $G -m hessians   # H cache -- shared
+# LNQ-F additionally needs the SIGNED first-order cache, which the squared
+# saliency pass does NOT produce (it stores (d l/d z)^2, sign discarded). This
+# script builds it automatically via firstorder_cache.py before quantizing.
+#
+# SANITY CHECK (do this first): run with MU=1e6. LNQ-F must then reproduce the
+# plain run_lnq.sh perplexity to within noise. If it does not, the first-order
+# path is wired wrong -- fix that before trusting any MU<inf number.
+#
+# Env overrides: DATASET, SEQ_LEN, NUM_EXAMPLES, NUM_ITER, CD_CYCLES,
+#                MU, MAX_SHIFT, SKIP_FIRSTORDER
+# ---------------------------------------------------------------------------
+set -x
+
+MODEL_REF=$1
+BITS=$2
+NUM_GROUPS=$3
+
+MODEL_PATH=$(python resolve_model.py "$MODEL_REF") || exit $?
+
+# Optional mode argument (tokens | hessians | quantize | pack), same as run_lnq.sh
+MODE_OPT=""
+MODE_VAL=""
+if [[ "$4" == "-m" && -n "$5" ]]; then
+  MODE_OPT="--mode $5"
+  MODE_VAL="$5"
+fi
+
+DATASET=${DATASET:-c4}
+SEQ_LEN=${SEQ_LEN:-2048}
+NUM_EXAMPLES=${NUM_EXAMPLES:-128}
+
+# ---- LNQ stage --------------------------------------------------------------
+NUM_ITER=${NUM_ITER:-3}
+CD_CYCLES=${CD_CYCLES:-4}
+
+# ---- first-order (B1) knobs -------------------------------------------------
+# MU large => plain LNQ; MU small => full first-order correction. Sweep it.
+MU=${MU:-1.0}
+# Per-row L2 trust-region cap on the target shift. 0 disables (full step).
+MAX_SHIFT=${MAX_SHIFT:-0.0}
+# Set SKIP_FIRSTORDER=1 to reuse an existing first-order cache without rebuilding.
+SKIP_FIRSTORDER=${SKIP_FIRSTORDER:-0}
+
+# ---------------------------------------------------------------------------
+# Step 1: build (or locate) the signed first-order cache.
+#         firstorder_cache.py prints the cache directory as its last stdout line.
+#         Skip entirely when we are only running the -m tokens/hessians stages,
+#         since those never reach the solver.
+# ---------------------------------------------------------------------------
+GBAR_ARG=""
+if [[ "$MODE_VAL" != "tokens" && "$MODE_VAL" != "hessians" ]]; then
+  if [[ "$SKIP_FIRSTORDER" != "1" ]]; then
+    GBAR_PATH=$(python firstorder_cache.py "$MODEL_PATH" \
+      --model_name "$MODEL_REF" \
+      --dataset "$DATASET" --seq_len "$SEQ_LEN" --num_examples "$NUM_EXAMPLES" \
+      --random_state 42 | tail -n 1) || exit $?
+  else
+    GBAR_PATH="cache/firstorder/${MODEL_REF##*/}-${DATASET}_s${NUM_EXAMPLES}_blk${SEQ_LEN}"
+  fi
+  GBAR_ARG="--lnqf_gbar_path $GBAR_PATH"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2: quantize with the LNQ-F solver.
+# ---------------------------------------------------------------------------
+python layerwise_nuq.py "$MODEL_PATH" \
+  --model_name "$MODEL_REF" \
+  --solver lnqf \
+  --seed_precision "$BITS" \
+  --dataset "$DATASET" --seq_len "$SEQ_LEN" --num_examples "$NUM_EXAMPLES" \
+  --num_groups "$NUM_GROUPS" --random_state 42 \
+  --num_iterations "$NUM_ITER" --cd_cycles "$CD_CYCLES" \
+  --lnqf_mu "$MU" \
+  --lnqf_max_shift "$MAX_SHIFT" \
+  $GBAR_ARG \
+  $MODE_OPT

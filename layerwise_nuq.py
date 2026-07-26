@@ -43,7 +43,19 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default=None,
                     help="Stable short name for cache paths (defaults to basename of model path)")
     parser.add_argument("--solver", type=str, default="lnq",
-                        choices=["lnq", "flexnu", "lnqflexnu", "lnqbopt"])
+                        choices=["lnq", "lnqf", "flexnu", "lnqflexnu", "lnqbopt"])
+    # --- LNQ-F (first-order term) knobs (only used when --solver lnqf) ---
+    parser.add_argument("--lnqf_mu", type=float, default=1.0,
+                        help="Damping on the Newton target shift. Large mu -> "
+                             "plain LNQ (B2 only); small mu -> full first-order "
+                             "correction (B1+B2).")
+    parser.add_argument("--lnqf_max_shift", type=float, default=0.0,
+                        help="Per-row L2 trust-region cap on the target shift "
+                             "||w_tilde - w||. <=0 disables the cap.")
+    parser.add_argument("--lnqf_gbar_path", type=str, default=None,
+                        help="Directory holding the signed first-order cache "
+                             "l{L}.pt -> {module: tensor[out, in]}. If unset, "
+                             "LNQ-F degrades to plain LNQ and logs it.")
     # --- staged B-opt knobs (only used when --solver lnqbopt) ---
     parser.add_argument("--bopt_stages", type=int, default=1,
                         help="1=B2 gating pass, 2=+B3, 3=+ejection chains")
@@ -86,7 +98,12 @@ if __name__ == "__main__":
     for k, v in vars(args).items():
         if k.startswith("bopt_") and v is not None:
             fk[k] = v
+    # LNQ-F knobs ride the same passthrough dict (full names); the lnqf branch reads them.
+    for k, v in vars(args).items():
+        if k.startswith("lnqf_") and v is not None:
+            fk[k] = v
     kw = {k: v for k, v in vars(args).items()
-      if v is not None and not k.startswith("flexnu_") and not k.startswith("bopt_")}
+      if v is not None and not k.startswith("flexnu_") and not k.startswith("bopt_")
+      and not k.startswith("lnqf_")}
     kw["flexnu_kwargs"] = fk
     layerwise_nuq(**kw)
