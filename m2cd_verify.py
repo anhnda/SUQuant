@@ -157,18 +157,14 @@ def m2cd_sweep(prob, p, matching):
         di = ri - e[:, i:i + 1]     # (R,m)
         dk = rk - e[:, k:k + 1]     # (R,m)
 
-        # outside field b_T = H[T,-T] e_{-T} = G_T - H_TT e_T
-        # G already includes contribution of coords i,k; subtract them.
+        # Exact joint gain in DELTA form vs current assignment (Section 1):
+        #   dl = 2(di*G_i + dk*G_k) + di^2 H_ii + dk^2 H_kk + 2 di dk H_ik
+        # G is the FULL current field e@H (same as scalar case); the cross-term
+        # 2 di dk H_ik exactly corrects the double-count, so no b_T subtraction.
         Hik = H[i, k]
-        bi = G[:, i] - (Hii[i] * e[:, i] + Hik * e[:, k])   # (R,)
-        bk = G[:, k] - (Hik * e[:, i] + Hii[k] * e[:, k])   # (R,)
-
-        # exact local change for joint move (qi,qk):
-        #   dl = 2(di*bi + dk*bk) + di^2 Hii + dk^2 Hkk + 2 di dk Hik
-        # broadcast over (R, m_i, m_k)
         DI = di.unsqueeze(2)   # (R,m,1)
         DK = dk.unsqueeze(1)   # (R,1,m)
-        dl = (2 * (DI * bi.view(-1, 1, 1) + DK * bk.view(-1, 1, 1))
+        dl = (2 * (DI * G[:, i].view(-1, 1, 1) + DK * G[:, k].view(-1, 1, 1))
               + DI.pow(2) * Hii[i] + DK.pow(2) * Hii[k]
               + 2 * DI * DK * Hik)                          # (R,m,m)
 
@@ -325,15 +321,16 @@ def oracle_improving_pairs(prob, p, neighbor_idx, row=0):
             di = ri - e[i]
             dk = rk - e[k]
             Hik = H[i, k]
-            bi = G[i] - (Hii[i] * e[i] + Hik * e[k])
-            bk = G[k] - (Hik * e[i] + Hii[k] * e[k])
-            DI = di.view(-1, 1)
-            DK = dk.view(1, -1)
-            dl = (2 * (DI * bi + DK * bk) + DI.pow(2) * Hii[i]
-                  + DK.pow(2) * Hii[k] + 2 * DI * DK * Hik)
-            # improving pair barrier: joint move helps but neither single move does
+            DI = di.view(-1, 1)               # (m,1) over qi
+            DK = dk.view(1, -1)               # (1,m) over qk
+            dl = (2 * (DI * G[i] + DK * G[k]) + DI.pow(2) * Hii[i]
+                  + DK.pow(2) * Hii[k] + 2 * DI * DK * Hik)   # (m,m)
+            # improving pair barrier: joint move helps but neither single move does.
+            # single moves live on the current-codeword slices: hold k at p[k]
+            # (column p[k]) or hold i at p[i] (row p[i]).
+            pk, pi = int(p[k]), int(p[i])
             best = dl.min()
-            single_best = min(dl[:, p[k]].min(), dl[p[i], :].min())
+            single_best = min(dl[:, pk].min(), dl[pi, :].min())
             if best < -1e-9 and best < single_best - 1e-9:
                 improving.add(frozenset((i, k)))
     return improving
@@ -342,8 +339,40 @@ def oracle_improving_pairs(prob, p, neighbor_idx, row=0):
 # ----------------------------------------------------------------------------
 # Main experiment
 # ----------------------------------------------------------------------------
+def selftest_pair_formula():
+    """Verify dl (delta pair gain) equals brute-force objective difference."""
+    prob = make_problem(d=32, R=4, n=64, m=4, block_corr=4, seed=7)
+    p = init_labels(prob)
+    H, c, m = prob["H"], prob["c"], prob["m"]
+    Hii = torch.diagonal(H)
+    e = residual(prob, p)
+    G = e @ H
+    cvec = c.view(-1)
+    i, k = 3, 5
+    L_before, _ = objective(prob, p)
+    max_err = 0.0
+    for qi in range(m):
+        for qk in range(m):
+            p2 = p.clone()
+            p2[:, i] = qi
+            p2[:, k] = qk
+            L_after, _ = objective(prob, p2)
+            true_delta = L_after - L_before               # (R,)
+            di = (cvec[qi] - prob["W"][:, i]) - e[:, i]
+            dk = (cvec[qk] - prob["W"][:, k]) - e[:, k]
+            dl = (2 * (di * G[:, i] + dk * G[:, k])
+                  + di.pow(2) * Hii[i] + dk.pow(2) * Hii[k]
+                  + 2 * di * dk * H[i, k])
+            max_err = max(max_err, float((dl - true_delta).abs().max()))
+    print(f"[selftest] max |formula - brute| = {max_err:.2e}  "
+          f"({'PASS' if max_err < 1e-6 else 'FAIL'})")
+    return max_err < 1e-6
+
+
 def main():
     torch.manual_seed(0)
+    print("=" * 74)
+    selftest_pair_formula()
     print("=" * 74)
     for m, bits in [(4, 2), (8, 3)]:
         prob = make_problem(d=256, R=64, n=512, m=m, block_corr=8, seed=1)
