@@ -13,6 +13,7 @@ from .utils import get_progress_bar
 from .layerwise_flexnu import train_flexnu
 from .layerwise_lnqflexnu import train_lnq_flexnu
 from .layerwise_lnqf import train_least_squares_firstorder
+from .layerwise_c2cd import train_c2cd
 @torch.no_grad()
 def objective_function(
     W: torch.Tensor, 
@@ -493,6 +494,18 @@ def seed_layer(
                 module_hessian,
                 num_iterations=num_iterations, cd_cycles=cd_cycles,
                 g_bar=g_bar, mu=lnqf_mu, max_shift=lnqf_max_shift,
+            )
+        elif solver == "c2cd":
+            # Correlation-matching M2-CD: same LNQ alternating solve, but the
+            # P-step is the exact m^2 pair-block update over a top-nu |H_ik|
+            # matching instead of 1-opt scalar CD. Knobs ride the passthrough.
+            bk = dict(flexnu_kwargs or {})
+            labels, C, log_dict = train_c2cd(
+                reshaped_module_weight, init_labels, init_centroids,
+                module_hessian,
+                num_iterations=num_iterations, cd_cycles=cd_cycles,
+                c2cd_nu=int(bk.get("c2cd_nu", 16)),
+                c2cd_cycles=bk.get("c2cd_cycles", None),
             )
         elif solver == "flexnu":
             _fk = {k: v for k, v in (flexnu_kwargs or {}).items()

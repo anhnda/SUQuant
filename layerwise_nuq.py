@@ -43,7 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default=None,
                     help="Stable short name for cache paths (defaults to basename of model path)")
     parser.add_argument("--solver", type=str, default="lnq",
-                        choices=["lnq", "lnqf", "flexnu", "lnqflexnu", "lnqbopt"])
+                        choices=["lnq", "lnqf", "flexnu", "lnqflexnu", "lnqbopt", "c2cd"])
     # --- Hessian estimator (default: true-label empirical Fisher) ---
     parser.add_argument("--mc_fisher", type=str2bool, default=False,
                         help="Use Monte-Carlo GGN/Fisher (pseudo-label) instead of "
@@ -80,6 +80,13 @@ if __name__ == "__main__":
     parser.add_argument("--bopt_verbose", type=str2bool, default=True,
                         help="Per-group/per-stage §2.6 instrumentation (funnel, "
                              "level-jumps, calib-vs-holdout)")
+    # --- correlation-matching M2-CD knobs (only used when --solver c2cd) ---
+    parser.add_argument("--c2cd_nu", type=int, default=16,
+                        help="top-nu correlation neighbours per coord for the "
+                             "M2-CD matching graph (normalised |H_ik|).")
+    parser.add_argument("--c2cd_cycles", type=int, default=None,
+                        help="number of M2-CD sweeps per P-step (fresh diverse "
+                             "matching each sweep). Defaults to cd_cycles.")
     parser.add_argument("--flexnu_iters", type=int, default=300)
     parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
     parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)
@@ -111,8 +118,12 @@ if __name__ == "__main__":
     for k, v in vars(args).items():
         if k.startswith("lnqf_") and v is not None:
             fk[k] = v
+    # c2cd knobs ride the same passthrough dict (full names); the c2cd branch reads them.
+    for k, v in vars(args).items():
+        if k.startswith("c2cd_") and v is not None:
+            fk[k] = v
     kw = {k: v for k, v in vars(args).items()
       if v is not None and not k.startswith("flexnu_") and not k.startswith("bopt_")
-      and not k.startswith("lnqf_")}
+      and not k.startswith("lnqf_") and not k.startswith("c2cd_")}
     kw["flexnu_kwargs"] = fk
     layerwise_nuq(**kw)
