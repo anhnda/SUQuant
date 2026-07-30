@@ -24,7 +24,9 @@ import logging
 import numpy as np
 import torch
 
-from .layerwise_quantize import objective_function, update_C
+
+# NOTE: objective_function / update_C are imported lazily inside train_c2cd to
+# avoid a circular import (layerwise_quantize imports this module at top level).
 
 
 # ----------------------------------------------------------------------------
@@ -160,6 +162,7 @@ def train_c2cd(
                   sweep). Defaults to cd_cycles so it matches LNQ's CD budget.
     """
     device = torch.device("cuda")
+    from .layerwise_quantize import objective_function, update_C  # lazy: avoids circular import
     if c2cd_cycles is None:
         c2cd_cycles = cd_cycles
     c2cd_nu = int(c2cd_nu)
