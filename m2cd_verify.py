@@ -398,11 +398,36 @@ def main():
         _, t_fixed, _ = run_m2cd(prob, p0, [fixed_m] * K)                  # B4
         p_corr, t_corr, stats = run_m2cd(prob, p0, corr_ms)               # main
 
+        # B0 to convergence: scalar CD until 1-opt fixed point (no K cap)
+        conv_sweeps = 0
+        p_conv = p0.clone()
+        L_conv = objective(prob, p_conv)[1].item()
+        for _ in range(200):
+            p_conv, mv = scalar_cd_sweep(prob, p_conv, list(range(prob["d"])))
+            conv_sweeps += 1
+            L_new = objective(prob, p_conv)[1].item()
+            if mv == 0 or abs(L_conv - L_new) < 1e-9:
+                L_conv = L_new
+                break
+            L_conv = L_new
+
+        # B1 compute-matched: each M2 sweep enumerates m^2 per pair (~d/2 blocks)
+        # vs scalar's m per coord (d coords). Extra scalar work per M2 sweep
+        # ~ m/2 factor -> give scalar that many equivalent extra sweeps, capped
+        # at convergence (can't beat the fixed point anyway).
+        extra = max(K, min(conv_sweeps, K * m // 2))
+        _, t_b1 = run_scalar(prob, p0, extra)                             # B1
+
         def red(traj):  # relative reduction vs L0
             return 100.0 * (L0 - traj[-1]) / L0
 
+        def redv(v):
+            return 100.0 * (L0 - v) / L0
+
         print(f"[{bits}-bit  m={m}]  L0={L0:.4f}   (lower L = better)")
-        print(f"  B0 scalar CD (natural)      L={t_scalar[-1]:.4f}  red={red(t_scalar):6.3f}%")
+        print(f"  B0 scalar CD (natural)      L={t_scalar[-1]:.4f}  red={red(t_scalar):6.3f}%  (K={K})")
+        print(f"  B0 scalar CD -> CONVERGED   L={L_conv:.4f}  red={redv(L_conv):6.3f}%  (sweeps={conv_sweeps})")
+        print(f"  B1 compute-matched scalar   L={t_b1[-1]:.4f}  red={red(t_b1):6.3f}%  (sweeps={extra})")
         print(f"  B2 paired-order scalar CD   L={t_paired[-1]:.4f}  red={red(t_paired):6.3f}%")
         print(f"  B3 random-matching M2-CD    L={t_rand[-1]:.4f}  red={red(t_rand):6.3f}%")
         print(f"  B4 repeated-matching M2-CD  L={t_fixed[-1]:.4f}  red={red(t_fixed):6.3f}%")
@@ -422,6 +447,12 @@ def main():
         # M2 dominates paired-order scalar from same init (Section 5 claim)
         dom = t_corr[-1] <= t_paired[-1] + 1e-9
         print(f"  M2-CD <= paired-order scalar CD: {dom}")
+
+        # the real test: does K-sweep M2-CD beat scalar CD's fixed point?
+        beats_conv = t_corr[-1] < L_conv
+        beats_b1 = t_corr[-1] < t_b1[-1]
+        print(f"  M2-CD (K={K}) < B0 converged: {beats_conv}   "
+              f"< B1 compute-matched: {beats_b1}")
 
         # --- oracle barrier recall (Section 13) on row 0 ---
         p_fix = find_1opt_fixed(prob, p0)
