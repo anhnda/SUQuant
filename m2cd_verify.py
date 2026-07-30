@@ -307,7 +307,8 @@ def oracle_improving_pairs(prob, p, neighbor_idx, row=0):
     sparse neighbor graph. Returns set of frozenset edges that improve."""
     H, c, m = prob["H"], prob["c"], prob["m"]
     Hii = torch.diagonal(H)
-    e = (c[p] - prob["W"])[row]        # (d,)
+    pr = p[row]                        # (d,) labels for this row
+    e = (c[pr] - prob["W"][row])       # (d,)
     G = (e @ H)                        # (d,)
     improving = set()
     cvec = c.view(-1)
@@ -328,7 +329,7 @@ def oracle_improving_pairs(prob, p, neighbor_idx, row=0):
             # improving pair barrier: joint move helps but neither single move does.
             # single moves live on the current-codeword slices: hold k at p[k]
             # (column p[k]) or hold i at p[i] (row p[i]).
-            pk, pi = int(p[k]), int(p[i])
+            pk, pi = int(pr[k]), int(pr[i])
             best = dl.min()
             single_best = min(dl[:, pk].min(), dl[pi, :].min())
             if best < -1e-9 and best < single_best - 1e-9:
